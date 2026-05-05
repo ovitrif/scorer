@@ -2,7 +2,7 @@ use crate::disk::{INBOUND_PAYMENTS_FNAME, OUTBOUND_PAYMENTS_FNAME};
 use crate::hex_utils;
 use crate::{
 	ChainMonitor, ChannelManager, HTLCStatus, InboundPaymentInfoStorage, MillisatAmount,
-	NetworkGraph, OutboundPaymentInfoStorage, PaymentInfo, PeerManager,
+	NetworkGraph, OutboundPaymentInfoStorage, OutputSweeper, PaymentInfo, PeerManager,
 };
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
@@ -19,11 +19,13 @@ use lightning::onion_message::dns_resolution::HumanReadableName;
 use lightning::onion_message::messenger::Destination;
 use lightning::routing::gossip::NodeId;
 use lightning::routing::router::{PaymentParameters, RouteParameters, RouteParametersConfig};
+use lightning::sign::SpendableOutputDescriptor;
 use lightning::sign::{EntropySource, KeysManager};
 use lightning::types::payment::{PaymentHash, PaymentPreimage};
 use lightning::util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig};
 use lightning::util::persist::KVStore;
 use lightning::util::ser::Writeable;
+use lightning::util::sweep::{OutputSpendStatus, TrackedSpendableOutput};
 use lightning_invoice::Bolt11Invoice;
 use lightning_persister::fs_store::FilesystemStore;
 use std::env;
@@ -67,7 +69,8 @@ pub(crate) async fn poll_for_user_input(
 	peer_manager: Arc<PeerManager>, channel_manager: Arc<ChannelManager>,
 	chain_monitor: Arc<ChainMonitor>, keys_manager: Arc<KeysManager>,
 	network_graph: Arc<NetworkGraph>, inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
-	outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>, fs_store: Arc<FilesystemStore>,
+	outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>, output_sweeper: Arc<OutputSweeper>,
+	fs_store: Arc<FilesystemStore>,
 ) {
 	println!(
 		"LDK startup successful. Enter \"help\" to view available commands. Press Ctrl-D to quit."
@@ -563,6 +566,8 @@ pub(crate) async fn poll_for_user_input(
 				"nodeinfo" => {
 					node_info(&channel_manager, &chain_monitor, &peer_manager, &network_graph)
 				},
+				"listclaimablebalances" => list_claimable_balances(&chain_monitor),
+				"listsweeperoutputs" => list_sweeper_outputs(&output_sweeper),
 				"listpeers" => list_peers(peer_manager.clone()),
 				"signmessage" => {
 					const MSG_STARTPOS: usize = "signmessage".len() + 1;
@@ -614,6 +619,99 @@ fn help() {
 	println!("\n  Other:");
 	println!("      signmessage <message>");
 	println!("      nodeinfo");
+	println!("      listclaimablebalances");
+	println!("      listsweeperoutputs");
+}
+
+fn list_claimable_balances(chain_monitor: &Arc<ChainMonitor>) {
+	let balances = chain_monitor.get_claimable_balances(&[]);
+	if balances.is_empty() {
+		println!("No claimable balances.");
+		return;
+	}
+
+	let total_claimable_sats =
+		balances.iter().map(|balance| balance.claimable_amount_satoshis()).sum::<u64>();
+	println!("Claimable balances: {} (total={} sats)", balances.len(), total_claimable_sats);
+	print!("[");
+	for balance in balances {
+		println!();
+		println!("\t{{");
+		println!("\t\tclaimable_amount_satoshis: {},", balance.claimable_amount_satoshis());
+		println!("\t\tdetails: {:?},", balance);
+		println!("\t}},");
+	}
+	println!("]");
+}
+
+fn descriptor_kind_and_outpoint(
+	tracked_output: &TrackedSpendableOutput,
+) -> (&'static str, lightning::chain::transaction::OutPoint) {
+	match &tracked_output.descriptor {
+		SpendableOutputDescriptor::StaticOutput { outpoint, .. } => ("static_output", *outpoint),
+		SpendableOutputDescriptor::DelayedPaymentOutput(output) => {
+			("delayed_payment_output", output.outpoint)
+		},
+		SpendableOutputDescriptor::StaticPaymentOutput(output) => {
+			("static_payment_output", output.outpoint)
+		},
+	}
+}
+
+fn output_spend_status_string(status: &OutputSpendStatus) -> String {
+	match status {
+		OutputSpendStatus::PendingInitialBroadcast { delayed_until_height } => {
+			if let Some(height) = delayed_until_height {
+				format!("pending_initial_broadcast (delayed_until_height={})", height)
+			} else {
+				"pending_initial_broadcast".to_string()
+			}
+		},
+		OutputSpendStatus::PendingFirstConfirmation { latest_broadcast_height, .. } => {
+			format!(
+				"pending_first_confirmation (latest_broadcast_height={})",
+				latest_broadcast_height
+			)
+		},
+		OutputSpendStatus::PendingThresholdConfirmations {
+			latest_broadcast_height,
+			confirmation_height,
+			..
+		} => {
+			format!(
+				"pending_threshold_confirmations (latest_broadcast_height={}, confirmation_height={})",
+				latest_broadcast_height,
+				confirmation_height
+			)
+		},
+	}
+}
+
+fn list_sweeper_outputs(output_sweeper: &Arc<OutputSweeper>) {
+	let outputs = output_sweeper.tracked_spendable_outputs();
+	if outputs.is_empty() {
+		println!("No tracked spendable outputs.");
+		return;
+	}
+
+	println!("Tracked spendable outputs: {}", outputs.len());
+	print!("[");
+	for tracked_output in outputs {
+		let (descriptor_kind, outpoint) = descriptor_kind_and_outpoint(&tracked_output);
+		let channel_id = tracked_output
+			.channel_id
+			.map(|channel_id| channel_id.to_string())
+			.unwrap_or_else(|| "none".to_string());
+
+		println!();
+		println!("\t{{");
+		println!("\t\tdescriptor_type: {},", descriptor_kind);
+		println!("\t\toutpoint: {},", outpoint);
+		println!("\t\tchannel_id: {},", channel_id);
+		println!("\t\tstatus: {},", output_spend_status_string(&tracked_output.status));
+		println!("\t}},");
+	}
+	println!("]");
 }
 
 fn node_info(

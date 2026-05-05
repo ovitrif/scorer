@@ -44,13 +44,16 @@ use lightning::routing::scoring::ProbabilisticScorer;
 use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
 use lightning::sign::{EntropySource, InMemorySigner, KeysManager, NodeSigner};
 use lightning::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
+use lightning::util::async_poll::AsyncResult;
 use lightning::util::config::UserConfig;
 use lightning::util::hash_tables::hash_map::Entry;
 use lightning::util::hash_tables::HashMap;
 use lightning::util::logger::Logger;
 use lightning::util::persist::{
-	self, KVStore, MonitorUpdatingPersisterAsync, OUTPUT_SWEEPER_PERSISTENCE_KEY,
+	self, KVStore, MonitorUpdatingPersister, OUTPUT_SWEEPER_PERSISTENCE_KEY,
 	OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
+	SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+	SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
 use lightning::util::sweep as ldk_sweep;
@@ -85,6 +88,13 @@ pub(crate) enum HTLCStatus {
 enum ProbeOutcome {
 	Success,
 	Failed,
+}
+
+#[derive(Debug)]
+enum ProbeError {
+	NoRoute(&'static str),
+	SendFailed(channelmanager::ProbeSendFailure),
+	InvalidInput(&'static str),
 }
 
 struct ProbeTracker {
@@ -177,14 +187,15 @@ type ChainMonitor = chainmonitor::ChainMonitor<
 	Arc<BitcoindClient>,
 	Arc<BitcoindClient>,
 	Arc<FilesystemLogger>,
-	chainmonitor::AsyncPersister<
-		Arc<FilesystemStore>,
-		TokioSpawner,
-		Arc<FilesystemLogger>,
-		Arc<KeysManager>,
-		Arc<KeysManager>,
-		Arc<BitcoindClient>,
-		Arc<BitcoindClient>,
+	Arc<
+		MonitorUpdatingPersister<
+			Arc<FilesystemStore>,
+			Arc<FilesystemLogger>,
+			Arc<KeysManager>,
+			Arc<KeysManager>,
+			Arc<BitcoindClient>,
+			Arc<BitcoindClient>,
+		>,
 	>,
 	Arc<KeysManager>,
 >;
@@ -239,7 +250,7 @@ pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
 	Arc<BitcoindClient>,
 	Arc<BitcoindClient>,
 	Arc<dyn Filter + Send + Sync>,
-	Arc<FilesystemStore>,
+	Arc<ScorerKeyRemappingStore>,
 	Arc<FilesystemLogger>,
 	Arc<KeysManager>,
 >;
@@ -247,11 +258,66 @@ pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
 // Needed due to rust-lang/rust#63033.
 struct OutputSweeperWrapper(Arc<OutputSweeper>);
 
-fn truncate_pubkey(pubkey: &str) -> String {
-	if pubkey.len() > 12 {
-		format!("{}...", &pubkey[..12])
+const SCORER_PERSISTENCE_FILE_NAME: &str = "scorer";
+
+fn remap_scorer_key<'a>(
+	primary_namespace: &str, secondary_namespace: &str, key: &'a str,
+) -> &'a str {
+	if primary_namespace == SCORER_PERSISTENCE_PRIMARY_NAMESPACE
+		&& secondary_namespace == SCORER_PERSISTENCE_SECONDARY_NAMESPACE
+		&& key == SCORER_PERSISTENCE_KEY
+	{
+		SCORER_PERSISTENCE_FILE_NAME
 	} else {
-		pubkey.to_string()
+		key
+	}
+}
+
+struct ScorerKeyRemappingStore {
+	inner: Arc<FilesystemStore>,
+}
+
+impl ScorerKeyRemappingStore {
+	fn new(inner: Arc<FilesystemStore>) -> Self {
+		Self { inner }
+	}
+}
+
+impl KVStore for ScorerKeyRemappingStore {
+	fn read(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+	) -> AsyncResult<'static, Vec<u8>, io::Error> {
+		let key = remap_scorer_key(primary_namespace, secondary_namespace, key);
+		self.inner.read(primary_namespace, secondary_namespace, key)
+	}
+
+	fn write(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
+	) -> AsyncResult<'static, (), io::Error> {
+		let key = remap_scorer_key(primary_namespace, secondary_namespace, key);
+		self.inner.write(primary_namespace, secondary_namespace, key, buf)
+	}
+
+	fn remove(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
+	) -> AsyncResult<'static, (), io::Error> {
+		let key = remap_scorer_key(primary_namespace, secondary_namespace, key);
+		self.inner.remove(primary_namespace, secondary_namespace, key, lazy)
+	}
+
+	fn list(
+		&self, primary_namespace: &str, secondary_namespace: &str,
+	) -> AsyncResult<'static, Vec<String>, io::Error> {
+		self.inner.list(primary_namespace, secondary_namespace)
+	}
+}
+
+fn extract_peer_pubkey(peer: &str) -> Option<&str> {
+	let pubkey = peer.split('@').next().unwrap_or("").trim();
+	if pubkey.is_empty() {
+		None
+	} else {
+		Some(pubkey)
 	}
 }
 
@@ -259,22 +325,22 @@ fn prepare_probe(
 	channel_manager: &ChannelManager, graph: &NetworkGraph, logger: &disk::FilesystemLogger,
 	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<disk::FilesystemLogger>>>,
 	pub_key_hex: &str, probe_amount: u64,
-) -> Option<PaymentHash> {
+) -> Result<PaymentHash, ProbeError> {
 	if probe_amount == 0 {
-		return None;
+		return Err(ProbeError::InvalidInput("probe amount must be greater than 0"));
 	}
-	let pub_key_bytes = hex_utils::to_vec(pub_key_hex)?;
-	if let Ok(pk) = bitcoin::secp256k1::PublicKey::from_slice(&pub_key_bytes) {
-		return send_probe(channel_manager, pk, graph, logger, probe_amount, scorer);
-	}
-	None
+	let pub_key_bytes = hex_utils::to_vec(pub_key_hex)
+		.ok_or(ProbeError::InvalidInput("invalid peer pubkey hex"))?;
+	let pk = bitcoin::secp256k1::PublicKey::from_slice(&pub_key_bytes)
+		.map_err(|_| ProbeError::InvalidInput("invalid peer pubkey"))?;
+	send_probe(channel_manager, pk, graph, logger, probe_amount, scorer)
 }
 
 fn send_probe(
 	channel_manager: &ChannelManager, recipient: PublicKey, graph: &NetworkGraph,
 	logger: &disk::FilesystemLogger, amt_msat: u64,
 	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<disk::FilesystemLogger>>>,
-) -> Option<PaymentHash> {
+) -> Result<PaymentHash, ProbeError> {
 	let chans = channel_manager.list_usable_channels();
 	let chan_refs = chans.iter().collect::<Vec<_>>();
 	let mut payment_params = PaymentParameters::from_node_id(recipient, 144);
@@ -282,7 +348,11 @@ fn send_probe(
 	let in_flight_htlcs = channel_manager.compute_inflight_htlcs();
 	let scorer = scorer.read().unwrap();
 	let inflight_scorer = ScorerAccountingForInFlightHtlcs::new(&scorer, &in_flight_htlcs);
-	let score_params: ProbabilisticScoringFeeParameters = Default::default();
+	let score_params = ProbabilisticScoringFeeParameters {
+		base_penalty_msat: 500_000,
+		base_penalty_amount_multiplier_msat: 131_072 * 3,
+		..Default::default()
+	};
 	let route_res = lightning::routing::router::find_route(
 		&channel_manager.get_our_node_id(),
 		&RouteParameters::from_payment_params_and_value(payment_params, amt_msat),
@@ -293,15 +363,10 @@ fn send_probe(
 		&score_params,
 		&[32; 32],
 	);
-	if let Ok(route) = route_res {
-		// We only send one probe per call (max_path_count = 1), so take the first path
-		if let Some(path) = route.paths.into_iter().next() {
-			if let Ok((payment_hash, _)) = channel_manager.send_probe(path) {
-				return Some(payment_hash);
-			}
-		}
-	}
-	None
+	let route = route_res.map_err(ProbeError::NoRoute)?;
+	let path = route.paths.into_iter().next().ok_or(ProbeError::NoRoute("route has no paths"))?;
+	let (payment_hash, _) = channel_manager.send_probe(path).map_err(ProbeError::SendFailed)?;
+	Ok(payment_hash)
 }
 
 async fn handle_ldk_events<'a>(
@@ -747,33 +812,33 @@ async fn start_ldk() {
 
 	// Step 5: Initialize Persistence
 	let fs_store = Arc::new(FilesystemStore::new(ldk_data_dir.clone().into()));
-	let persister = MonitorUpdatingPersisterAsync::new(
+	let scorer_store = Arc::new(ScorerKeyRemappingStore::new(Arc::clone(&fs_store)));
+	let persister = Arc::new(MonitorUpdatingPersister::new(
 		Arc::clone(&fs_store),
-		TokioSpawner,
 		Arc::clone(&logger),
 		1000,
 		Arc::clone(&keys_manager),
 		Arc::clone(&keys_manager),
 		Arc::clone(&bitcoind_client),
 		Arc::clone(&bitcoind_client),
-	);
+	));
 	// Alternatively, you can use the `FilesystemStore` as a `Persist` directly, at the cost of
 	// larger `ChannelMonitor` update writes (but no deletion or cleanup):
 	//let persister = Arc::clone(&fs_store);
 
 	// Step 6: Read ChannelMonitor state from disk
-	let mut channelmonitors = persister.read_all_channel_monitors_with_updates().await.unwrap();
+	let mut channelmonitors = persister.read_all_channel_monitors_with_updates().unwrap();
 	// If you are using the `FilesystemStore` as a `Persist` directly, use
 	// `lightning::util::persist::read_channel_monitors` like this:
 	// read_channel_monitors(Arc::clone(&persister), Arc::clone(&keys_manager), Arc::clone(&keys_manager)).unwrap();
 
 	// Step 7: Initialize the ChainMonitor
-	let chain_monitor: Arc<ChainMonitor> = Arc::new(chainmonitor::ChainMonitor::new_async_beta(
+	let chain_monitor: Arc<ChainMonitor> = Arc::new(chainmonitor::ChainMonitor::new(
 		None,
 		Arc::clone(&broadcaster),
 		Arc::clone(&logger),
 		Arc::clone(&fee_estimator),
-		persister,
+		Arc::clone(&persister),
 		Arc::clone(&keys_manager),
 		keys_manager.get_peer_storage_key(),
 	));
@@ -788,7 +853,7 @@ async fn start_ldk() {
 	let network_graph =
 		Arc::new(disk::read_network(Path::new(&network_graph_path), args.network, logger.clone()));
 
-	let scorer_path = format!("{}/scorer", ldk_data_dir.clone());
+	let scorer_path = format!("{}/{}", ldk_data_dir.clone(), SCORER_PERSISTENCE_FILE_NAME);
 	let scorer = Arc::new(RwLock::new(disk::read_scorer(
 		Path::new(&scorer_path),
 		Arc::clone(&network_graph),
@@ -796,7 +861,11 @@ async fn start_ldk() {
 	)));
 
 	// Step 10: Create Routers
-	let scoring_fee_params = ProbabilisticScoringFeeParameters::default();
+	let scoring_fee_params = ProbabilisticScoringFeeParameters {
+		base_penalty_msat: 500_000,
+		base_penalty_amount_multiplier_msat: 131_072 * 3,
+		..Default::default()
+	};
 	let router = Arc::new(DefaultRouter::new(
 		network_graph.clone(),
 		logger.clone(),
@@ -877,7 +946,7 @@ async fn start_ldk() {
 				None,
 				keys_manager.clone(),
 				bitcoind_client.clone(),
-				fs_store.clone(),
+				scorer_store.clone(),
 				logger.clone(),
 			);
 			(channel_manager.current_best_block(), sweeper)
@@ -889,7 +958,7 @@ async fn start_ldk() {
 				None,
 				keys_manager.clone(),
 				bitcoind_client.clone(),
-				fs_store.clone(),
+				scorer_store.clone(),
 				logger.clone(),
 			);
 			let mut reader = io::Cursor::new(&mut bytes);
@@ -1192,7 +1261,7 @@ async fn start_ldk() {
 	// Step 21: Background Processing
 	let (bp_exit, bp_exit_check) = tokio::sync::watch::channel(());
 	let mut background_processor = tokio::spawn(process_events_async(
-		Arc::clone(&fs_store),
+		Arc::clone(&scorer_store),
 		event_handler,
 		Arc::clone(&chain_monitor),
 		Arc::clone(&channel_manager),
@@ -1275,11 +1344,13 @@ async fn start_ldk() {
 			match dns_bootstrap::DnsBootstrapper::new(dns_config) {
 				Ok(bootstrapper) => {
 					let bootstrap_pm = Arc::clone(&peer_manager);
+					let bootstrap_logger = Arc::clone(&logger);
 					let stop_bootstrap = Arc::clone(&stop_listen_connect);
 					let interval_secs = bootstrapper.interval_secs();
 					let num_peers = bootstrapper.num_peers();
 
-					println!(
+					lightning::log_info!(
+						&*logger,
 						"DNS bootstrap enabled: {} seeds, target {} peers, interval {}s",
 						bootstrapper.config().seeds.len(),
 						num_peers,
@@ -1312,9 +1383,16 @@ async fn start_ldk() {
 								})
 								.collect();
 
-							match bootstrapper.sample_node_addrs(num_peers, &ignore).await {
+							match bootstrapper
+								.sample_node_addrs(num_peers, &ignore, &*bootstrap_logger)
+								.await
+							{
 								Ok(peers) => {
-									println!("[dns_bootstrap] Discovered {} peers", peers.len());
+									lightning::log_info!(
+										&*bootstrap_logger,
+										"[dns_bootstrap] Discovered {} peers",
+										peers.len()
+									);
 									for peer in peers {
 										let _ = cli::do_connect_peer(
 											peer.pubkey,
@@ -1325,14 +1403,22 @@ async fn start_ldk() {
 									}
 								},
 								Err(e) => {
-									eprintln!("[dns_bootstrap] Bootstrap failed: {}", e);
+									lightning::log_warn!(
+										&*bootstrap_logger,
+										"[dns_bootstrap] Bootstrap failed: {}",
+										e
+									);
 								},
 							}
 						}
 					});
 				},
 				Err(e) => {
-					eprintln!("[dns_bootstrap] Failed to initialize bootstrapper: {}", e);
+					lightning::log_error!(
+						&*logger,
+						"[dns_bootstrap] Failed to initialize bootstrapper: {}",
+						e
+					);
 				},
 			}
 		}
@@ -1413,7 +1499,14 @@ async fn start_ldk() {
 					// Probe each peer with amounts from smallest to largest
 					let peer_count = probe_config.peers.len();
 					for (peer_idx, peer) in probe_config.peers.iter().enumerate() {
-						let peer_short = truncate_pubkey(peer);
+						let Some(peer_pubkey) = extract_peer_pubkey(peer) else {
+							lightning::log_warn!(
+								&*probing_logger,
+								"Probe skipped: invalid peer entry '{}' (expected pubkey@host:port or pubkey)",
+								peer
+							);
+							continue;
+						};
 						'amounts: for &amount in &sorted_amounts {
 							// Send the probe and get the payment hash
 							let payment_hash = prepare_probe(
@@ -1421,86 +1514,161 @@ async fn start_ldk() {
 								&probing_graph,
 								&probing_logger,
 								&probing_scorer,
-								peer,
+								peer_pubkey,
 								amount,
 							);
 
-							if let Some(hash) = payment_hash {
-								lightning::log_info!(
-									&*probing_logger,
-									"Probe SENT to {} for {} msat (hash: {})",
-									peer_short,
-									amount,
-									hash
-								);
+							match payment_hash {
+								Ok(hash) => {
+									lightning::log_info!(
+										&*probing_logger,
+										"Probe SENT to {} for {} msat (hash: {})",
+										peer_pubkey,
+										amount,
+										hash
+									);
 
-								// Register the probe and get a receiver for the outcome
-								let rx = probing_tracker.lock().unwrap().register_probe(hash);
+									// Register the probe and get a receiver for the outcome
+									let rx = probing_tracker.lock().unwrap().register_probe(hash);
 
-								// Wait for the probe outcome with timeout
-								let outcome = tokio::time::timeout(probe_timeout, rx).await;
+									// Wait for the probe outcome with timeout
+									let outcome = tokio::time::timeout(probe_timeout, rx).await;
 
-								match outcome {
-									Ok(Ok(ProbeOutcome::Success)) => {
-										lightning::log_info!(
-											&*probing_logger,
-											"Probe SUCCESS to {} for {} msat (hash: {})",
-											peer_short,
-											amount,
-											hash
-										);
-										// Probe succeeded, sleep before next amount
-										tokio::time::sleep(probe_delay).await;
-									},
-									Ok(Ok(ProbeOutcome::Failed)) => {
-										lightning::log_warn!(
-											&*probing_logger,
-											"Probe FAILED to {} for {} msat (hash: {}), skipping remaining amounts",
-											peer_short,
-											amount,
-											hash
-										);
-										tokio::time::sleep(probe_delay).await;
-										break 'amounts;
-									},
-									Ok(Err(_)) => {
-										lightning::log_warn!(
-											&*probing_logger,
-											"Probe DROPPED to {} for {} msat (hash: {}), channel closed, skipping remaining amounts",
-											peer_short,
-											amount,
-											hash
-										);
-										tokio::time::sleep(probe_delay).await;
-										break 'amounts;
-									},
-									Err(_) => {
-										lightning::log_warn!(
-											&*probing_logger,
-											"Probe TIMEOUT to {} for {} msat (hash: {}), skipping remaining amounts",
-											peer_short,
-											amount,
-											hash
-										);
-										// Clean up the pending probe to avoid memory leak
-										probing_tracker
-											.lock()
-											.unwrap()
-											.pending_probes
-											.remove(&hash);
-										tokio::time::sleep(probe_delay).await;
-										break 'amounts;
-									},
-								}
-							} else {
-								lightning::log_warn!(
-									&*probing_logger,
-									"Probe NO_ROUTE to {} for {} msat, skipping remaining amounts",
-									peer_short,
-									amount
-								);
-								tokio::time::sleep(probe_delay).await;
-								break 'amounts;
+									match outcome {
+										Ok(Ok(ProbeOutcome::Success)) => {
+											lightning::log_info!(
+												&*probing_logger,
+												"Probe SUCCESS to {} for {} msat (hash: {})",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											lightning::log_info!(
+												&*probing_logger,
+												"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											// Probe succeeded, sleep before next amount
+											tokio::time::sleep(probe_delay).await;
+										},
+										Ok(Ok(ProbeOutcome::Failed)) => {
+											lightning::log_warn!(
+												&*probing_logger,
+												"Probe FAILED to {} for {} msat (hash: {}), skipping remaining amounts",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											lightning::log_warn!(
+												&*probing_logger,
+												"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											tokio::time::sleep(probe_delay).await;
+											break 'amounts;
+										},
+										Ok(Err(_)) => {
+											lightning::log_warn!(
+												&*probing_logger,
+												"Probe DROPPED to {} for {} msat (hash: {}), channel closed, skipping remaining amounts",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											lightning::log_warn!(
+												&*probing_logger,
+												"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											tokio::time::sleep(probe_delay).await;
+											break 'amounts;
+										},
+										Err(_) => {
+											lightning::log_warn!(
+												&*probing_logger,
+												"Probe TIMEOUT to {} for {} msat (hash: {}), skipping remaining amounts",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											lightning::log_warn!(
+												&*probing_logger,
+												"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
+												peer_pubkey,
+												amount,
+												hash
+											);
+											// Clean up the pending probe to avoid memory leak
+											probing_tracker
+												.lock()
+												.unwrap()
+												.pending_probes
+												.remove(&hash);
+											tokio::time::sleep(probe_delay).await;
+											break 'amounts;
+										},
+									}
+								},
+								Err(ProbeError::NoRoute(err)) => {
+									lightning::log_warn!(
+										&*probing_logger,
+										"Probe NO_ROUTE to {} for {} msat (error: {}), skipping remaining amounts",
+										peer_pubkey,
+										amount,
+										err
+									);
+									lightning::log_warn!(
+										&*probing_logger,
+										"probe_completed destination_node={} amount_msat={} state=NO_ROUTE error={}",
+										peer_pubkey,
+										amount,
+										err
+									);
+									tokio::time::sleep(probe_delay).await;
+									break 'amounts;
+								},
+								Err(ProbeError::SendFailed(err)) => {
+									lightning::log_warn!(
+										&*probing_logger,
+										"Probe SEND_FAILED to {} for {} msat (error: {:?}), skipping remaining amounts",
+										peer_pubkey,
+										amount,
+										err
+									);
+									lightning::log_warn!(
+										&*probing_logger,
+										"probe_completed destination_node={} amount_msat={} state=SEND_FAILED error={:?}",
+										peer_pubkey,
+										amount,
+										err
+									);
+									tokio::time::sleep(probe_delay).await;
+									break 'amounts;
+								},
+								Err(ProbeError::InvalidInput(err)) => {
+									lightning::log_warn!(
+										&*probing_logger,
+										"Probe INVALID_INPUT to {} for {} msat (error: {}), skipping remaining amounts",
+										peer_pubkey,
+										amount,
+										err
+									);
+									lightning::log_warn!(
+										&*probing_logger,
+										"probe_completed destination_node={} amount_msat={} state=INVALID_INPUT error={}",
+										peer_pubkey,
+										amount,
+										err
+									);
+									tokio::time::sleep(probe_delay).await;
+									break 'amounts;
+								},
 							}
 						}
 
@@ -1560,6 +1728,7 @@ async fn start_ldk() {
 	let cli_chain_monitor = Arc::clone(&chain_monitor);
 	let cli_fs_store = Arc::clone(&fs_store);
 	let cli_peer_manager = Arc::clone(&peer_manager);
+	let cli_output_sweeper = Arc::clone(&output_sweeper);
 	let cli_poll = tokio::task::spawn(cli::poll_for_user_input(
 		cli_peer_manager,
 		cli_channel_manager,
@@ -1568,6 +1737,7 @@ async fn start_ldk() {
 		network_graph,
 		inbound_payments,
 		outbound_payments,
+		cli_output_sweeper,
 		cli_fs_store,
 	));
 

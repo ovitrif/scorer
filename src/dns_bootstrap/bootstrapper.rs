@@ -4,6 +4,7 @@ use super::query::SrvQueryExecutor;
 use super::DnsBootstrapError;
 use bitcoin::secp256k1::PublicKey;
 use lightning::routing::gossip::NodeId;
+use lightning::util::logger::Logger;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -43,7 +44,7 @@ impl DnsBootstrapper {
 	/// public keys from bech32-encoded hostnames, resolves IP addresses, and
 	/// returns up to `num_addrs` peers not present in `ignore`.
 	pub async fn sample_node_addrs(
-		&self, num_addrs: usize, ignore: &HashSet<NodeId>,
+		&self, num_addrs: usize, ignore: &HashSet<NodeId>, logger: &impl Logger,
 	) -> Result<Vec<BootstrappedPeer>, DnsBootstrapError> {
 		let mut peers = Vec::new();
 
@@ -56,17 +57,31 @@ impl DnsBootstrapper {
 			let srv_records = match self.query_executor.query_srv(seed).await {
 				Ok(records) => records,
 				Err(e) => {
-					eprintln!("[dns_bootstrap] SRV query failed for {}: {}", seed, e);
+					lightning::log_warn!(
+						logger,
+						"[dns_bootstrap] SRV query failed for {}: {}",
+						seed,
+						e
+					);
 					continue;
 				},
 			};
 
 			if srv_records.is_empty() {
-				eprintln!("[dns_bootstrap] No SRV records returned from {}", seed);
+				lightning::log_info!(
+					logger,
+					"[dns_bootstrap] No SRV records returned from {}",
+					seed
+				);
 				continue;
 			}
 
-			eprintln!("[dns_bootstrap] Got {} SRV records from {}", srv_records.len(), seed);
+			lightning::log_info!(
+				logger,
+				"[dns_bootstrap] Got {} SRV records from {}",
+				srv_records.len(),
+				seed
+			);
 
 			// Process each SRV record.
 			for srv in srv_records {
@@ -78,9 +93,11 @@ impl DnsBootstrapper {
 				let (pubkey, node_id) = match decode_pubkey_from_hostname(&srv.target) {
 					Ok(result) => result,
 					Err(e) => {
-						eprintln!(
+						lightning::log_info!(
+							logger,
 							"[dns_bootstrap] Failed to decode pubkey from {}: {}",
-							srv.target, e
+							srv.target,
+							e
 						);
 						continue;
 					},
@@ -95,7 +112,12 @@ impl DnsBootstrapper {
 				let ip = match self.query_executor.resolve_host(&srv.target).await {
 					Ok(ip) => ip,
 					Err(e) => {
-						eprintln!("[dns_bootstrap] Failed to resolve {}: {}", srv.target, e);
+						lightning::log_info!(
+							logger,
+							"[dns_bootstrap] Failed to resolve {}: {}",
+							srv.target,
+							e
+						);
 						continue;
 					},
 				};
