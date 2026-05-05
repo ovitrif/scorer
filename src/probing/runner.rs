@@ -30,6 +30,21 @@ struct ProbingModes {
 	random_graph: bool,
 }
 
+#[derive(Copy, Clone)]
+enum ProbeMode {
+	Whitelist,
+	RandomGraph,
+}
+
+impl ProbeMode {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Whitelist => "whitelist",
+			Self::RandomGraph => "random_graph",
+		}
+	}
+}
+
 enum ProbeCompletion {
 	Success(PaymentHash),
 	Failed(PaymentHash),
@@ -110,8 +125,14 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 						)
 						.await;
 
-						log_probe_completed(&logger, peer_pubkey, amount, &completion);
-						sleep_probe_delay(probe_delay).await;
+					log_probe_completed(
+						&logger,
+						ProbeMode::Whitelist,
+						peer_pubkey,
+						amount,
+						&completion,
+					);
+					sleep_probe_delay(probe_delay).await;
 
 						if completion.should_break_peer_amounts() {
 							break;
@@ -169,7 +190,13 @@ pub(crate) fn spawn_probing_loop(probe_config: ProbingConfig, deps: ProbingDeps)
 					)
 					.await;
 
-					log_probe_completed(&logger, &destination_node, amount, &completion);
+					log_probe_completed(
+						&logger,
+						ProbeMode::RandomGraph,
+						&destination_node,
+						amount,
+						&completion,
+					);
 					sleep_probe_delay(probe_delay).await;
 				}
 			}
@@ -242,14 +269,17 @@ fn log_startup(
 }
 
 fn log_probe_completed(
-	logger: &FilesystemLogger, destination_node: &str, amount_msat: u64,
+	logger: &FilesystemLogger, mode: ProbeMode, destination_node: &str, amount_msat: u64,
 	completion: &ProbeCompletion,
 ) {
+	let mode = mode.as_str();
+
 	match completion {
 		ProbeCompletion::Success(hash) => {
 			lightning::log_info!(
 				logger,
-				"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
+				"probe_completed mode={} destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
+				mode,
 				destination_node,
 				amount_msat,
 				hash
@@ -258,7 +288,8 @@ fn log_probe_completed(
 		ProbeCompletion::Failed(hash) => {
 			lightning::log_warn!(
 				logger,
-				"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
+				"probe_completed mode={} destination_node={} amount_msat={} state=FAILED payment_hash={}",
+				mode,
 				destination_node,
 				amount_msat,
 				hash
@@ -267,7 +298,8 @@ fn log_probe_completed(
 		ProbeCompletion::Dropped(hash) => {
 			lightning::log_warn!(
 				logger,
-				"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
+				"probe_completed mode={} destination_node={} amount_msat={} state=DROPPED payment_hash={}",
+				mode,
 				destination_node,
 				amount_msat,
 				hash
@@ -276,7 +308,8 @@ fn log_probe_completed(
 		ProbeCompletion::Timeout(hash) => {
 			lightning::log_warn!(
 				logger,
-				"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
+				"probe_completed mode={} destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
+				mode,
 				destination_node,
 				amount_msat,
 				hash
@@ -285,7 +318,8 @@ fn log_probe_completed(
 		ProbeCompletion::SendError(ProbeError::NoRoute(err)) => {
 			lightning::log_warn!(
 				logger,
-				"probe_completed destination_node={} amount_msat={} state=NO_ROUTE error={}",
+				"probe_completed mode={} destination_node={} amount_msat={} state=NO_ROUTE error={}",
+				mode,
 				destination_node,
 				amount_msat,
 				err
@@ -294,7 +328,8 @@ fn log_probe_completed(
 		ProbeCompletion::SendError(ProbeError::SendFailed(err)) => {
 			lightning::log_warn!(
 				logger,
-				"probe_completed destination_node={} amount_msat={} state=SEND_FAILED error={:?}",
+				"probe_completed mode={} destination_node={} amount_msat={} state=SEND_FAILED error={:?}",
+				mode,
 				destination_node,
 				amount_msat,
 				err
@@ -303,7 +338,8 @@ fn log_probe_completed(
 		ProbeCompletion::SendError(ProbeError::InvalidInput(err)) => {
 			lightning::log_warn!(
 				logger,
-				"probe_completed destination_node={} amount_msat={} state=INVALID_INPUT error={}",
+				"probe_completed mode={} destination_node={} amount_msat={} state=INVALID_INPUT error={}",
+				mode,
 				destination_node,
 				amount_msat,
 				err
