@@ -27,6 +27,7 @@ use lightning_block_sync::{AsyncBlockSourceResult, BlockData, BlockHeaderData, B
 use serde_json;
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -66,6 +67,44 @@ impl BlockSource for BitcoindClient {
 
 /// The minimum feerate we are allowed to send, as specify by LDK.
 const MIN_FEERATE: u32 = 253;
+
+/// Helper used by [`BitcoindClient::poll_for_fee_estimates`] to call
+/// `estimatesmartfee` for one confirmation target, enforce the
+/// `MIN_FEERATE` floor, fall back to `fallback_when_none` when bitcoind
+/// returns no estimate, and preserve the previous stored value when the
+/// RPC itself fails.
+///
+/// Factored out to remove ~140 lines of near-identical copy-paste.
+#[allow(clippy::too_many_arguments)]
+async fn estimate_smartfee<F>(
+	rpc_client: &RpcClient, logger: &FilesystemLogger, conf_target_blocks: u32, mode: &str,
+	fallback_when_none: u32, fallback_target_for_previous: ConfirmationTarget, label: &str,
+	load_current: &F,
+) -> u32
+where
+	F: Fn(ConfirmationTarget) -> u32,
+{
+	let conf_target = serde_json::json!(conf_target_blocks);
+	let estimate_mode = serde_json::json!(mode);
+	match rpc_client
+		.call_method::<FeeResponse>("estimatesmartfee", &[conf_target, estimate_mode])
+		.await
+	{
+		Ok(resp) => match resp.feerate_sat_per_kw {
+			Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
+			None => fallback_when_none,
+		},
+		Err(e) => {
+			lightning::log_warn!(
+				logger,
+				"Fee polling {} estimatesmartfee failed: {}. Keeping previous value.",
+				label,
+				e
+			);
+			load_current(fallback_target_for_previous)
+		},
+	}
+}
 
 impl BitcoindClient {
 	pub(crate) async fn new(
@@ -125,152 +164,113 @@ impl BitcoindClient {
 	) {
 		handle.spawn(async move {
 			loop {
-				let load_current =
-					|target: ConfirmationTarget| fees.get(&target).unwrap().load(Ordering::Acquire);
-
-				let mempoolmin_estimate = {
-					match rpc_client
-						.call_method::<MempoolMinFeeResponse>("getmempoolinfo", &[])
-						.await
-					{
-						Ok(resp) => match resp.feerate_sat_per_kw {
-							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-							None => MIN_FEERATE,
-						},
-						Err(e) => {
-							lightning::log_warn!(
-								&*logger,
-								"Fee polling getmempoolinfo failed: {}. Keeping previous value.",
-								e
-							);
-							load_current(ConfirmationTarget::MinAllowedAnchorChannelRemoteFee)
-						},
+				let load_current = |target: ConfirmationTarget| {
+					if let Some(value) = fees.get(&target) {
+						value.load(Ordering::Acquire)
+					} else {
+						lightning::log_error!(
+							&*logger,
+							"Missing fee bucket for {:?}, defaulting to MIN_FEERATE",
+							target
+						);
+						MIN_FEERATE
 					}
 				};
-				let background_estimate = {
-					let background_conf_target = serde_json::json!(144);
-					let background_estimate_mode = serde_json::json!("ECONOMICAL");
-					match rpc_client
-						.call_method::<FeeResponse>(
-							"estimatesmartfee",
-							&[background_conf_target, background_estimate_mode],
-						)
-						.await
-					{
-						Ok(resp) => match resp.feerate_sat_per_kw {
-							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-							None => MIN_FEERATE,
-						},
-						Err(e) => {
-							lightning::log_warn!(
-								&*logger,
-								"Fee polling background estimatesmartfee failed: {}. Keeping previous value.",
-								e
-							);
-							load_current(ConfirmationTarget::AnchorChannelFee)
-						},
+				let store_fee = |target: ConfirmationTarget, value: u32| {
+					if let Some(slot) = fees.get(&target) {
+						slot.store(value, Ordering::Release);
+					} else {
+						lightning::log_error!(&*logger, "Missing fee bucket for {:?}", target);
 					}
 				};
 
-				let normal_estimate = {
-					let normal_conf_target = serde_json::json!(18);
-					let normal_estimate_mode = serde_json::json!("ECONOMICAL");
-					match rpc_client
-						.call_method::<FeeResponse>(
-							"estimatesmartfee",
-							&[normal_conf_target, normal_estimate_mode],
-						)
-						.await
-					{
-						Ok(resp) => match resp.feerate_sat_per_kw {
-							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-							None => 2000,
-						},
-						Err(e) => {
-							lightning::log_warn!(
-								&*logger,
-								"Fee polling normal estimatesmartfee failed: {}. Keeping previous value.",
-								e
-							);
-							load_current(ConfirmationTarget::NonAnchorChannelFee)
-						},
-					}
+				// `getmempoolinfo` is shaped differently from
+				// `estimatesmartfee` (different RPC method, different
+				// response type), so it's the one call that cannot go
+				// through `estimate_smartfee`.
+				let mempoolmin_estimate = match rpc_client
+					.call_method::<MempoolMinFeeResponse>("getmempoolinfo", &[])
+					.await
+				{
+					Ok(resp) => resp.feerate_sat_per_kw.map(|f| f.max(MIN_FEERATE)).unwrap_or(MIN_FEERATE),
+					Err(e) => {
+						lightning::log_warn!(
+							&*logger,
+							"Fee polling getmempoolinfo failed: {}. Keeping previous value.",
+							e
+						);
+						load_current(ConfirmationTarget::MinAllowedAnchorChannelRemoteFee)
+					},
 				};
 
-				let high_prio_estimate = {
-					let high_prio_conf_target = serde_json::json!(6);
-					let high_prio_estimate_mode = serde_json::json!("CONSERVATIVE");
-					match rpc_client
-						.call_method::<FeeResponse>(
-							"estimatesmartfee",
-							&[high_prio_conf_target, high_prio_estimate_mode],
-						)
-						.await
-					{
-						Ok(resp) => match resp.feerate_sat_per_kw {
-							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-							None => 5000,
-						},
-						Err(e) => {
-							lightning::log_warn!(
-								&*logger,
-								"Fee polling high-priority estimatesmartfee failed: {}. Keeping previous value.",
-								e
-							);
-							load_current(ConfirmationTarget::UrgentOnChainSweep)
-						},
-					}
-				};
+				// Each row:  (conf_target_blocks, mode, fallback_when_rpc_returns_none,
+				//             fallback_target_for_previous_value, human_label)
+				//
+				// Previously this was ~140 lines of 5 near-identical
+				// `match rpc_client.call_method::<FeeResponse>(...)` blocks.
+				// Collapsing to one helper kept every semantic: the
+				// minimum-floor at MIN_FEERATE, the per-target fallback
+				// default, and the per-target "keep previous value on RPC
+				// error" behaviour (via `load_current`).
+				let background_estimate = estimate_smartfee(
+					&rpc_client,
+					&logger,
+					144,
+					"ECONOMICAL",
+					MIN_FEERATE,
+					ConfirmationTarget::AnchorChannelFee,
+					"background",
+					&load_current,
+				)
+				.await;
+				let normal_estimate = estimate_smartfee(
+					&rpc_client,
+					&logger,
+					18,
+					"ECONOMICAL",
+					2000,
+					ConfirmationTarget::NonAnchorChannelFee,
+					"normal",
+					&load_current,
+				)
+				.await;
+				let high_prio_estimate = estimate_smartfee(
+					&rpc_client,
+					&logger,
+					6,
+					"CONSERVATIVE",
+					5000,
+					ConfirmationTarget::UrgentOnChainSweep,
+					"high-priority",
+					&load_current,
+				)
+				.await;
+				let very_high_prio_estimate = estimate_smartfee(
+					&rpc_client,
+					&logger,
+					2,
+					"CONSERVATIVE",
+					50000,
+					ConfirmationTarget::MaximumFeeEstimate,
+					"very-high-priority",
+					&load_current,
+				)
+				.await;
 
-				let very_high_prio_estimate = {
-					let high_prio_conf_target = serde_json::json!(2);
-					let high_prio_estimate_mode = serde_json::json!("CONSERVATIVE");
-					match rpc_client
-						.call_method::<FeeResponse>(
-							"estimatesmartfee",
-							&[high_prio_conf_target, high_prio_estimate_mode],
-						)
-						.await
-					{
-						Ok(resp) => match resp.feerate_sat_per_kw {
-							Some(feerate) => std::cmp::max(feerate, MIN_FEERATE),
-							None => 50000,
-						},
-						Err(e) => {
-							lightning::log_warn!(
-								&*logger,
-								"Fee polling very-high-priority estimatesmartfee failed: {}. Keeping previous value.",
-								e
-							);
-							load_current(ConfirmationTarget::MaximumFeeEstimate)
-						},
-					}
-				};
-
-				fees.get(&ConfirmationTarget::MaximumFeeEstimate)
-					.unwrap()
-					.store(very_high_prio_estimate, Ordering::Release);
-				fees.get(&ConfirmationTarget::UrgentOnChainSweep)
-					.unwrap()
-					.store(high_prio_estimate, Ordering::Release);
-				fees.get(&ConfirmationTarget::MinAllowedAnchorChannelRemoteFee)
-					.unwrap()
-					.store(mempoolmin_estimate, Ordering::Release);
-				fees.get(&ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee)
-					.unwrap()
-					.store(background_estimate.saturating_sub(250), Ordering::Release);
-				fees.get(&ConfirmationTarget::AnchorChannelFee)
-					.unwrap()
-					.store(background_estimate, Ordering::Release);
-				fees.get(&ConfirmationTarget::NonAnchorChannelFee)
-					.unwrap()
-					.store(normal_estimate, Ordering::Release);
-				fees.get(&ConfirmationTarget::ChannelCloseMinimum)
-					.unwrap()
-					.store(background_estimate, Ordering::Release);
-				fees.get(&ConfirmationTarget::OutputSpendingFee)
-					.unwrap()
-					.store(background_estimate, Ordering::Release);
+				store_fee(ConfirmationTarget::MaximumFeeEstimate, very_high_prio_estimate);
+				store_fee(ConfirmationTarget::UrgentOnChainSweep, high_prio_estimate);
+				store_fee(
+					ConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
+					mempoolmin_estimate,
+				);
+				store_fee(
+					ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
+					background_estimate.saturating_sub(250),
+				);
+				store_fee(ConfirmationTarget::AnchorChannelFee, background_estimate);
+				store_fee(ConfirmationTarget::NonAnchorChannelFee, normal_estimate);
+				store_fee(ConfirmationTarget::ChannelCloseMinimum, background_estimate);
+				store_fee(ConfirmationTarget::OutputSpendingFee, background_estimate);
 
 				tokio::time::sleep(Duration::from_secs(60)).await;
 			}
@@ -283,15 +283,16 @@ impl BitcoindClient {
 		RpcClient::new(&rpc_credentials, http_endpoint)
 	}
 
-	pub async fn create_raw_transaction(&self, outputs: Vec<HashMap<String, f64>>) -> RawTx {
+	pub async fn create_raw_transaction(
+		&self, outputs: Vec<HashMap<String, f64>>,
+	) -> io::Result<RawTx> {
 		let outputs_json = serde_json::json!(outputs);
 		self.bitcoind_rpc_client
 			.call_method::<RawTx>("createrawtransaction", &[serde_json::json!([]), outputs_json])
 			.await
-			.unwrap()
 	}
 
-	pub async fn fund_raw_transaction(&self, raw_tx: RawTx) -> FundedTx {
+	pub async fn fund_raw_transaction(&self, raw_tx: RawTx) -> io::Result<FundedTx> {
 		let raw_tx_json = serde_json::json!(raw_tx.0);
 		let options = serde_json::json!({
 			// LDK gives us feerates in satoshis per KW but Bitcoin Core here expects fees
@@ -306,57 +307,68 @@ impl BitcoindClient {
 			// change address or to a new channel output negotiated with the same node.
 			"replaceable": false,
 		});
-		self.bitcoind_rpc_client
-			.call_method("fundrawtransaction", &[raw_tx_json, options])
-			.await
-			.unwrap()
+		self.bitcoind_rpc_client.call_method("fundrawtransaction", &[raw_tx_json, options]).await
 	}
 
-	pub async fn send_raw_transaction(&self, raw_tx: RawTx) {
+	pub async fn send_raw_transaction(&self, raw_tx: RawTx) -> io::Result<()> {
 		let raw_tx_json = serde_json::json!(raw_tx.0);
 		self.bitcoind_rpc_client
 			.call_method::<Txid>("sendrawtransaction", &[raw_tx_json])
 			.await
-			.unwrap();
+			.map(|_| ())
 	}
 
 	pub fn sign_raw_transaction_with_wallet(
 		&self, tx_hex: String,
-	) -> impl Future<Output = SignedTx> {
+	) -> impl Future<Output = io::Result<SignedTx>> {
 		let tx_hex_json = serde_json::json!(tx_hex);
 		let rpc_client = self.get_new_rpc_client();
-		async move {
-			rpc_client.call_method("signrawtransactionwithwallet", &[tx_hex_json]).await.unwrap()
-		}
+		async move { rpc_client.call_method("signrawtransactionwithwallet", &[tx_hex_json]).await }
 	}
 
-	pub fn get_new_address(&self) -> impl Future<Output = Address> {
+	pub fn get_new_address(&self) -> impl Future<Output = io::Result<Address>> {
 		let addr_args = [serde_json::json!("LDK output address")];
 		let network = self.network;
 		let rpc_client = self.get_new_rpc_client();
 		async move {
-			let addr =
-				rpc_client.call_method::<NewAddress>("getnewaddress", &addr_args).await.unwrap();
-			Address::from_str(addr.0.as_str()).unwrap().require_network(network).unwrap()
+			let addr = rpc_client.call_method::<NewAddress>("getnewaddress", &addr_args).await?;
+			let parsed = Address::from_str(addr.0.as_str()).map_err(|e| {
+				io::Error::new(
+					io::ErrorKind::InvalidData,
+					format!("bitcoind returned invalid address {}: {}", addr.0, e),
+				)
+			})?;
+			parsed.require_network(network).map_err(|e| {
+				io::Error::new(
+					io::ErrorKind::InvalidData,
+					format!("bitcoind returned address for wrong network: {}", e),
+				)
+			})
 		}
 	}
 
-	pub async fn get_blockchain_info(&self) -> BlockchainInfo {
-		self.bitcoind_rpc_client
-			.call_method::<BlockchainInfo>("getblockchaininfo", &[])
-			.await
-			.unwrap()
+	pub async fn get_blockchain_info(&self) -> io::Result<BlockchainInfo> {
+		self.bitcoind_rpc_client.call_method::<BlockchainInfo>("getblockchaininfo", &[]).await
 	}
 
-	pub fn list_unspent(&self) -> impl Future<Output = ListUnspentResponse> {
+	pub fn list_unspent(&self) -> impl Future<Output = io::Result<ListUnspentResponse>> {
 		let rpc_client = self.get_new_rpc_client();
-		async move { rpc_client.call_method::<ListUnspentResponse>("listunspent", &[]).await.unwrap() }
+		async move { rpc_client.call_method::<ListUnspentResponse>("listunspent", &[]).await }
 	}
 }
 
 impl FeeEstimator for BitcoindClient {
 	fn get_est_sat_per_1000_weight(&self, confirmation_target: ConfirmationTarget) -> u32 {
-		self.fees.get(&confirmation_target).unwrap().load(Ordering::Acquire)
+		if let Some(fee) = self.fees.get(&confirmation_target) {
+			fee.load(Ordering::Acquire)
+		} else {
+			lightning::log_error!(
+				&*self.logger,
+				"Missing fee bucket for {:?}, defaulting to MIN_FEERATE",
+				confirmation_target
+			);
+			MIN_FEERATE
+		}
 	}
 }
 
@@ -386,17 +398,23 @@ impl BroadcasterInterface for BitcoindClient {
 			};
 			// This may error due to RL calling `broadcast_transactions` with the same transaction
 			// multiple times, but the error is safe to ignore.
-			match res {
-				Ok(_) => {}
-				Err(e) => {
-					let err_str =
-						e.get_ref().map(|inner| inner.to_string()).unwrap_or_else(|| e.to_string());
-					log_error!(logger,
-						"Warning, failed to broadcast a transaction, this is likely okay but may indicate an error: {}\nTransactions: {:?}",
-						err_str,
-						txn);
-					print!("Warning, failed to broadcast a transaction, this is likely okay but may indicate an error: {}\n> ", err_str);
-				}
+			//
+			// Historically we also emitted a `print!` here so the REPL user
+			// would see the warning; it has been removed because (a) it
+			// duplicated the log line without the timestamp/level prefix,
+			// and (b) it printed without a newline discipline that
+			// interleaved badly with `> ` prompt redraws. The log_error!
+			// entry above reaches the rotating log file in `disk.rs` and
+			// is the canonical record.
+			if let Err(e) = res {
+				let err_str =
+					e.get_ref().map(|inner| inner.to_string()).unwrap_or_else(|| e.to_string());
+				log_error!(
+					logger,
+					"Warning, failed to broadcast a transaction, this is likely okay but may indicate an error: {}\nTransactions: {:?}",
+					err_str,
+					txn
+				);
 			}
 		});
 	}
@@ -404,14 +422,16 @@ impl BroadcasterInterface for BitcoindClient {
 
 impl ChangeDestinationSource for BitcoindClient {
 	fn get_change_destination_script<'a>(&'a self) -> AsyncResult<'a, ScriptBuf, ()> {
-		Box::pin(async move { Ok(self.get_new_address().await.script_pubkey()) })
+		Box::pin(async move {
+			self.get_new_address().await.map(|addr| addr.script_pubkey()).map_err(|_| ())
+		})
 	}
 }
 
 impl WalletSource for BitcoindClient {
 	fn list_confirmed_utxos<'a>(&'a self) -> AsyncResult<'a, Vec<Utxo>, ()> {
 		Box::pin(async move {
-			let utxos = self.list_unspent().await.0;
+			let utxos = self.list_unspent().await.map_err(|_| ())?.0;
 			Ok(utxos
 				.into_iter()
 				.filter_map(|utxo| {
@@ -445,7 +465,9 @@ impl WalletSource for BitcoindClient {
 	}
 
 	fn get_change_script<'a>(&'a self) -> AsyncResult<'a, ScriptBuf, ()> {
-		Box::pin(async move { Ok(self.get_new_address().await.script_pubkey()) })
+		Box::pin(async move {
+			self.get_new_address().await.map(|addr| addr.script_pubkey()).map_err(|_| ())
+		})
 	}
 
 	fn sign_psbt<'a>(&'a self, tx: Psbt) -> AsyncResult<'a, Transaction, ()> {
@@ -453,7 +475,7 @@ impl WalletSource for BitcoindClient {
 			let mut tx_bytes = Vec::new();
 			let _ = tx.unsigned_tx.consensus_encode(&mut tx_bytes).map_err(|_| ());
 			let tx_hex = hex_utils::hex_str(&tx_bytes);
-			let signed_tx = self.sign_raw_transaction_with_wallet(tx_hex).await;
+			let signed_tx = self.sign_raw_transaction_with_wallet(tx_hex).await.map_err(|_| ())?;
 			let signed_tx_bytes = hex_utils::to_vec(&signed_tx.hex).ok_or(())?;
 			Transaction::consensus_decode(&mut signed_tx_bytes.as_slice()).map_err(|_| ())
 		})

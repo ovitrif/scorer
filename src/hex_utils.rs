@@ -2,6 +2,10 @@ use bitcoin::secp256k1::PublicKey;
 use std::fmt::Write;
 
 pub fn to_vec(hex: &str) -> Option<Vec<u8>> {
+	if (hex.len() & 1) != 0 {
+		return None;
+	}
+
 	let mut out = Vec::with_capacity(hex.len() / 2);
 
 	let mut b = 0;
@@ -37,4 +41,17 @@ pub fn to_compressed_pubkey(hex: &str) -> Option<PublicKey> {
 	}
 	let data = to_vec(&hex[0..33 * 2])?;
 	PublicKey::from_slice(&data).ok()
+}
+
+#[cfg(test)]
+mod tests {
+	#[test]
+	fn to_vec_rejects_odd_length() {
+		assert!(super::to_vec("abc").is_none());
+	}
+
+	#[test]
+	fn to_vec_decodes_even_length_hex() {
+		assert_eq!(super::to_vec("0aBc"), Some(vec![0x0a, 0xbc]));
+	}
 }

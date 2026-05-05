@@ -7,47 +7,32 @@ mod bootstrapper;
 pub use bootstrapper::DnsBootstrapper;
 pub use config::DnsBootstrapConfig;
 
-use std::fmt;
+use thiserror::Error;
 
 /// Errors that can occur during DNS bootstrap operations.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum DnsBootstrapError {
 	/// SRV query failed on all seeds.
+	#[error("SRV query failed: {0}")]
 	SrvQueryFailed(String),
 
 	/// A/AAAA resolution failed for a node hostname.
+	#[error("host resolution failed for {hostname}: {reason}")]
 	HostResolutionFailed { hostname: String, reason: String },
 
 	/// Bech32 decoding of node ID from hostname failed.
+	#[error("invalid bech32 node ID in {hostname}: {reason}")]
 	InvalidBech32NodeId { hostname: String, reason: String },
 
 	/// Decoded bytes are not a valid secp256k1 public key.
+	#[error("invalid public key: {reason}")]
 	InvalidPublicKey { reason: String },
 
 	/// DNS operation timed out.
+	#[error("DNS operation timed out")]
 	Timeout,
 
 	/// Internal DNS resolver error.
+	#[error("resolver error: {0}")]
 	ResolverError(String),
 }
-
-impl fmt::Display for DnsBootstrapError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::SrvQueryFailed(msg) => write!(f, "SRV query failed: {}", msg),
-			Self::HostResolutionFailed { hostname, reason } => {
-				write!(f, "host resolution failed for {}: {}", hostname, reason)
-			},
-			Self::InvalidBech32NodeId { hostname, reason } => {
-				write!(f, "invalid bech32 node ID in {}: {}", hostname, reason)
-			},
-			Self::InvalidPublicKey { reason } => {
-				write!(f, "invalid public key: {}", reason)
-			},
-			Self::Timeout => write!(f, "DNS operation timed out"),
-			Self::ResolverError(msg) => write!(f, "resolver error: {}", msg),
-		}
-	}
-}
-
-impl std::error::Error for DnsBootstrapError {}

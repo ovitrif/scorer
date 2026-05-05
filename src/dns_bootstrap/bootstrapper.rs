@@ -10,12 +10,14 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 /// A discovered peer: public key + network address.
+///
+/// The LDK `NodeId` is trivially derivable from `pubkey` via
+/// `NodeId::from_pubkey(&pubkey)`, so we deliberately do not store it here
+/// to avoid the invariant-maintenance burden of two fields that must agree.
 #[derive(Debug, Clone)]
 pub struct BootstrappedPeer {
 	/// The node's secp256k1 public key.
 	pub pubkey: PublicKey,
-	/// The node's LDK NodeId (derived from pubkey, retained for future use).
-	pub _node_id: NodeId,
 	/// The node's network address (IP + port from SRV record).
 	pub addr: SocketAddr,
 }
@@ -122,8 +124,12 @@ impl DnsBootstrapper {
 					},
 				};
 
+				// `node_id` was used just above for the ignore-set check;
+				// we intentionally do not store it on the peer, see the
+				// note on `BootstrappedPeer`.
+				let _ = node_id;
 				let addr = SocketAddr::new(ip, srv.port);
-				peers.push(BootstrappedPeer { pubkey, _node_id: node_id, addr });
+				peers.push(BootstrappedPeer { pubkey, addr });
 			}
 		}
 

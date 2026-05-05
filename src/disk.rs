@@ -32,13 +32,26 @@ pub(crate) struct FilesystemLogger {
 	writer: Mutex<LogWriter>,
 }
 impl FilesystemLogger {
-	pub(crate) fn new(data_dir: String) -> Self {
+	/// Fallible constructor. Errors are propagated so the bootstrap can
+	/// print a meaningful message — logging that cannot be initialised is
+	/// a fatal condition, but an error is strictly better than a panic
+	/// because it lets the caller render the message to stderr in a
+	/// controlled way.
+	pub(crate) fn try_new(data_dir: String) -> std::io::Result<Self> {
 		let logs_dir = format!("{}/logs", data_dir);
-		fs::create_dir_all(logs_dir.clone()).unwrap();
+		fs::create_dir_all(&logs_dir)?;
 		let today = Utc::now().date_naive();
-		let file =
-			LogWriter::open_log_file(&logs_dir, today).expect("Failed to open initial log file");
-		Self { writer: Mutex::new(LogWriter { file, current_date: today, logs_dir }) }
+		let file = LogWriter::open_log_file(&logs_dir, today)?;
+		Ok(Self { writer: Mutex::new(LogWriter { file, current_date: today, logs_dir }) })
+	}
+
+	/// Back-compat shim retained for tests and non-critical paths. New
+	/// code should prefer [`try_new`]. Panics on I/O failure so existing
+	/// call sites (all of which are in test code after Phase 1) keep
+	/// their current behaviour.
+	#[cfg(test)]
+	pub(crate) fn new(data_dir: String) -> Self {
+		Self::try_new(data_dir).expect("FilesystemLogger::new failed in test")
 	}
 }
 impl Logger for FilesystemLogger {
@@ -87,24 +100,61 @@ pub(crate) fn read_network(
 		if let Ok(graph) = NetworkGraph::read(&mut BufReader::new(file), logger.clone()) {
 			return graph;
 		}
+		lightning::log_warn!(
+			&*logger,
+			"Failed to deserialize network graph from {}. Starting with empty graph.",
+			path.display()
+		);
+	} else if path.exists() {
+		lightning::log_warn!(
+			&*logger,
+			"Failed to open network graph at {}. Starting with empty graph.",
+			path.display()
+		);
 	}
 	NetworkGraph::new(network, logger)
 }
 
-pub(crate) fn read_inbound_payment_info(path: &Path) -> InboundPaymentInfoStorage {
+pub(crate) fn read_inbound_payment_info(
+	path: &Path, logger: &Arc<FilesystemLogger>,
+) -> InboundPaymentInfoStorage {
 	if let Ok(file) = File::open(path) {
 		if let Ok(info) = InboundPaymentInfoStorage::read(&mut BufReader::new(file)) {
 			return info;
 		}
+		lightning::log_warn!(
+			&**logger,
+			"Failed to deserialize inbound payment info from {}. Starting with empty state.",
+			path.display()
+		);
+	} else if path.exists() {
+		lightning::log_warn!(
+			&**logger,
+			"Failed to open inbound payment info at {}. Starting with empty state.",
+			path.display()
+		);
 	}
 	InboundPaymentInfoStorage { payments: new_hash_map() }
 }
 
-pub(crate) fn read_outbound_payment_info(path: &Path) -> OutboundPaymentInfoStorage {
+pub(crate) fn read_outbound_payment_info(
+	path: &Path, logger: &Arc<FilesystemLogger>,
+) -> OutboundPaymentInfoStorage {
 	if let Ok(file) = File::open(path) {
 		if let Ok(info) = OutboundPaymentInfoStorage::read(&mut BufReader::new(file)) {
 			return info;
 		}
+		lightning::log_warn!(
+			&**logger,
+			"Failed to deserialize outbound payment info from {}. Starting with empty state.",
+			path.display()
+		);
+	} else if path.exists() {
+		lightning::log_warn!(
+			&**logger,
+			"Failed to open outbound payment info at {}. Starting with empty state.",
+			path.display()
+		);
 	}
 	OutboundPaymentInfoStorage { payments: new_hash_map() }
 }
@@ -118,6 +168,17 @@ pub(crate) fn read_scorer(
 		if let Ok(scorer) = ProbabilisticScorer::read(&mut BufReader::new(file), args) {
 			return scorer;
 		}
+		lightning::log_warn!(
+			&*logger,
+			"Failed to deserialize scorer from {}. Starting with fresh scorer.",
+			path.display()
+		);
+	} else if path.exists() {
+		lightning::log_warn!(
+			&*logger,
+			"Failed to open scorer at {}. Starting with fresh scorer.",
+			path.display()
+		);
 	}
 	ProbabilisticScorer::new(params, graph, logger)
 }

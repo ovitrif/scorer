@@ -4,16 +4,18 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 /// A single SRV record returned from a DNS seed query.
+///
+/// Note: SRV `priority` and `weight` fields exist in the DNS protocol but
+/// are intentionally omitted here because BOLT-0010 sampling treats every
+/// record as equal-weight (we reservoir-sample peers elsewhere). If you
+/// introduce priority-aware selection, reintroduce the fields rather than
+/// reserving underscore-prefixed placeholders.
 #[derive(Debug, Clone)]
 pub struct SrvRecord {
 	/// Virtual hostname (e.g. `ln1q....<seed>.`).
 	pub target: String,
 	/// Port the node is listening on.
 	pub port: u16,
-	/// SRV priority (retained for future use).
-	pub _priority: u16,
-	/// SRV weight (retained for future use).
-	pub _weight: u16,
 }
 
 /// Executes DNS SRV queries and A/AAAA lookups for BOLT-0010 bootstrap.
@@ -45,12 +47,7 @@ impl SrvQueryExecutor {
 
 		let records: Vec<SrvRecord> = lookup
 			.iter()
-			.map(|srv| SrvRecord {
-				target: srv.target().to_utf8(),
-				port: srv.port(),
-				_priority: srv.priority(),
-				_weight: srv.weight(),
-			})
+			.map(|srv| SrvRecord { target: srv.target().to_utf8(), port: srv.port() })
 			.collect();
 
 		Ok(records)

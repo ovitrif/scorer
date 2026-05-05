@@ -1,3 +1,10 @@
+#![allow(clippy::drop_non_drop)]
+// Phase 0 guardrail: catches the most common async footgun — holding a
+// std::sync::Mutex / RwLock guard across an `.await` point. This is the
+// lint that makes Phase 4 (tokio::sync::Mutex for payments) a compile-time
+// invariant rather than a careful-code convention.
+#![deny(clippy::await_holding_lock)]
+
 mod args;
 pub mod bitcoind_client;
 mod cli;
@@ -5,726 +12,131 @@ mod config;
 mod convert;
 mod disk;
 mod dns_bootstrap;
+mod events;
 mod hex_utils;
+#[macro_use]
+mod logging;
+mod net;
+mod persist;
+mod probing;
 mod rapid_sync;
+mod runtime_config;
+mod state;
 mod sweep;
+mod types;
+
+pub(crate) use disk::FilesystemLogger;
+pub(crate) use state::{
+	HTLCStatus, InboundPaymentInfoStorage, MillisatAmount, OutboundPaymentInfoStorage, PaymentInfo,
+};
+pub(crate) use types::{
+	BumpTxEventHandler, ChainMonitor, ChannelManager, GossipVerifier, NetworkGraph, OnionMessenger,
+	OutputSweeper, PeerManager,
+};
 
 use crate::bitcoind_client::BitcoindClient;
-use crate::disk::FilesystemLogger;
-use bitcoin::blockdata::transaction::Transaction;
-use bitcoin::consensus::encode;
+use crate::persist::{ScorerKeyRemappingStore, SCORER_PERSISTENCE_FILE_NAME};
 use bitcoin::io;
-use bitcoin::network::Network;
-use bitcoin::secp256k1::PublicKey;
 use bitcoin::BlockHash;
-use bitcoin_bech32::WitnessProgram;
 use disk::{INBOUND_PAYMENTS_FNAME, OUTBOUND_PAYMENTS_FNAME};
+use lightning::chain;
 use lightning::chain::{chainmonitor, ChannelMonitorUpdateStatus};
-use lightning::chain::{BestBlock, Filter};
+use lightning::chain::BestBlock;
 use lightning::events::bump_transaction::{BumpTransactionEventHandler, Wallet};
-use lightning::events::{Event, PaymentFailureReason, PaymentPurpose};
+use lightning::events::Event;
 use lightning::ln::channelmanager::{self, RecentPaymentDetails};
-use lightning::ln::channelmanager::{
-	ChainParameters, ChannelManagerReadArgs, PaymentId, SimpleArcChannelManager,
-};
-use lightning::ln::msgs::DecodeError;
-use lightning::ln::peer_handler::{
-	IgnoringMessageHandler, MessageHandler, PeerManager as LdkPeerManager,
-};
-use lightning::ln::types::ChannelId;
-use lightning::onion_message::messenger::{
-	DefaultMessageRouter, OnionMessenger as LdkOnionMessenger,
-};
-use lightning::routing::gossip;
-use lightning::routing::gossip::{NodeId, P2PGossipSync};
-use lightning::routing::router::{
-	DefaultRouter, PaymentParameters, RouteParameters, ScorerAccountingForInFlightHtlcs,
-};
-use lightning::routing::scoring::ProbabilisticScorer;
+use lightning::ln::channelmanager::{ChainParameters, ChannelManagerReadArgs, PaymentId};
+use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler};
+use lightning::onion_message::messenger::DefaultMessageRouter;
+use lightning::routing::gossip::NodeId;
+use lightning::routing::gossip::P2PGossipSync;
+use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
-use lightning::sign::{EntropySource, InMemorySigner, KeysManager, NodeSigner};
-use lightning::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
-use lightning::util::async_poll::AsyncResult;
+use lightning::sign::{KeysManager, NodeSigner};
 use lightning::util::config::UserConfig;
-use lightning::util::hash_tables::hash_map::Entry;
-use lightning::util::hash_tables::HashMap;
 use lightning::util::logger::Logger;
+// `lightning::util::persist` is imported as `ldk_persist` because our
+// local `crate::persist` module (home of `ScorerKeyRemappingStore`) shadows
+// the upstream name in this file.
+use lightning::util::persist as ldk_persist;
 use lightning::util::persist::{
-	self, KVStore, MonitorUpdatingPersister, OUTPUT_SWEEPER_PERSISTENCE_KEY,
+	KVStore, MonitorUpdatingPersister, OUTPUT_SWEEPER_PERSISTENCE_KEY,
 	OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
-	SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
-	SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
-use lightning::util::sweep as ldk_sweep;
-use lightning::{chain, impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
+use lightning::util::ser::{ReadableArgs, Writeable};
 use lightning_background_processor::{process_events_async, GossipSync, NO_LIQUIDITY_MANAGER};
 use lightning_block_sync::gossip::TokioSpawner;
 use lightning_block_sync::{init, poll, BlockSourceErrorKind, SpvClient, UnboundedCache};
 use lightning_dns_resolver::OMDomainResolver;
-use lightning_net_tokio::SocketDescriptor;
 use lightning_persister::fs_store::FilesystemStore;
 use rand::{thread_rng, Rng};
-use std::collections::HashMap as StdHashMap;
 use std::convert::TryInto;
-use std::fmt;
 use std::fs;
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
-#[derive(Copy, Clone)]
-pub(crate) enum HTLCStatus {
-	Pending,
-	Succeeded,
-	Failed,
-}
-
-#[derive(Clone, Debug)]
-enum ProbeOutcome {
-	Success,
-	Failed,
-}
-
-#[derive(Debug)]
-enum ProbeError {
-	NoRoute(&'static str),
-	SendFailed(channelmanager::ProbeSendFailure),
-	InvalidInput(&'static str),
-}
-
-struct ProbeTracker {
-	pending_probes: StdHashMap<PaymentHash, tokio::sync::oneshot::Sender<ProbeOutcome>>,
-}
-
-impl ProbeTracker {
-	fn new() -> Self {
-		Self { pending_probes: StdHashMap::new() }
-	}
-
-	fn register_probe(
-		&mut self, payment_hash: PaymentHash,
-	) -> tokio::sync::oneshot::Receiver<ProbeOutcome> {
-		let (tx, rx) = tokio::sync::oneshot::channel();
-		self.pending_probes.insert(payment_hash, tx);
-		rx
-	}
-
-	fn complete_probe(&mut self, payment_hash: &PaymentHash, outcome: ProbeOutcome) {
-		if let Some(sender) = self.pending_probes.remove(payment_hash) {
-			let _ = sender.send(outcome);
-		}
-	}
-}
-
-impl_writeable_tlv_based_enum!(HTLCStatus,
-	(0, Pending) => {},
-	(1, Succeeded) => {},
-	(2, Failed) => {},
-);
-
-pub(crate) struct MillisatAmount(Option<u64>);
-
-impl fmt::Display for MillisatAmount {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		match self.0 {
-			Some(amt) => write!(f, "{}", amt),
-			None => write!(f, "unknown"),
-		}
-	}
-}
-
-impl Readable for MillisatAmount {
-	fn read<R: io::Read>(r: &mut R) -> Result<Self, DecodeError> {
-		let amt: Option<u64> = Readable::read(r)?;
-		Ok(MillisatAmount(amt))
-	}
-}
-
-impl Writeable for MillisatAmount {
-	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
-		self.0.write(w)
-	}
-}
-
-pub(crate) struct PaymentInfo {
-	preimage: Option<PaymentPreimage>,
-	secret: Option<PaymentSecret>,
-	status: HTLCStatus,
-	amt_msat: MillisatAmount,
-}
-
-impl_writeable_tlv_based!(PaymentInfo, {
-	(0, preimage, required),
-	(2, secret, required),
-	(4, status, required),
-	(6, amt_msat, required),
-});
-
-pub(crate) struct InboundPaymentInfoStorage {
-	payments: HashMap<PaymentHash, PaymentInfo>,
-}
-
-impl_writeable_tlv_based!(InboundPaymentInfoStorage, {
-	(0, payments, required),
-});
-
-pub(crate) struct OutboundPaymentInfoStorage {
-	payments: HashMap<PaymentId, PaymentInfo>,
-}
-
-impl_writeable_tlv_based!(OutboundPaymentInfoStorage, {
-	(0, payments, required),
-});
-
-type ChainMonitor = chainmonitor::ChainMonitor<
-	InMemorySigner,
-	Arc<dyn Filter + Send + Sync>,
-	Arc<BitcoindClient>,
-	Arc<BitcoindClient>,
-	Arc<FilesystemLogger>,
-	Arc<
-		MonitorUpdatingPersister<
-			Arc<FilesystemStore>,
-			Arc<FilesystemLogger>,
-			Arc<KeysManager>,
-			Arc<KeysManager>,
-			Arc<BitcoindClient>,
-			Arc<BitcoindClient>,
-		>,
-	>,
-	Arc<KeysManager>,
->;
-
-pub(crate) type GossipVerifier = lightning_block_sync::gossip::GossipVerifier<
-	TokioSpawner,
-	Arc<lightning_block_sync::rpc::RpcClient>,
-	Arc<FilesystemLogger>,
->;
-
-// Note that if you do not use an `OMDomainResolver` here you should use SimpleArcPeerManager
-// instead.
-pub(crate) type PeerManager = LdkPeerManager<
-	SocketDescriptor,
-	Arc<ChannelManager>,
-	Arc<P2PGossipSync<Arc<NetworkGraph>, Arc<GossipVerifier>, Arc<FilesystemLogger>>>,
-	Arc<OnionMessenger>,
-	Arc<FilesystemLogger>,
-	IgnoringMessageHandler,
-	Arc<KeysManager>,
-	Arc<ChainMonitor>,
->;
-
-pub(crate) type ChannelManager =
-	SimpleArcChannelManager<ChainMonitor, BitcoindClient, BitcoindClient, FilesystemLogger>;
-
-pub(crate) type NetworkGraph = gossip::NetworkGraph<Arc<FilesystemLogger>>;
-
-// Note that if you do not use an `OMDomainResolver` here you should use SimpleArcOnionMessenger
-// instead.
-type OnionMessenger = LdkOnionMessenger<
-	Arc<KeysManager>,
-	Arc<KeysManager>,
-	Arc<FilesystemLogger>,
-	Arc<ChannelManager>,
-	Arc<DefaultMessageRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>, Arc<KeysManager>>>,
-	Arc<ChannelManager>,
-	Arc<ChannelManager>,
-	Arc<OMDomainResolver<Arc<ChannelManager>>>,
-	IgnoringMessageHandler,
->;
-
-pub(crate) type BumpTxEventHandler = BumpTransactionEventHandler<
-	Arc<BitcoindClient>,
-	Arc<Wallet<Arc<BitcoindClient>, Arc<FilesystemLogger>>>,
-	Arc<KeysManager>,
-	Arc<FilesystemLogger>,
->;
-
-pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
-	Arc<BitcoindClient>,
-	Arc<BitcoindClient>,
-	Arc<BitcoindClient>,
-	Arc<dyn Filter + Send + Sync>,
-	Arc<ScorerKeyRemappingStore>,
-	Arc<FilesystemLogger>,
-	Arc<KeysManager>,
->;
-
-// Needed due to rust-lang/rust#63033.
-struct OutputSweeperWrapper(Arc<OutputSweeper>);
-
-const SCORER_PERSISTENCE_FILE_NAME: &str = "scorer";
-
-fn remap_scorer_key<'a>(
-	primary_namespace: &str, secondary_namespace: &str, key: &'a str,
-) -> &'a str {
-	if primary_namespace == SCORER_PERSISTENCE_PRIMARY_NAMESPACE
-		&& secondary_namespace == SCORER_PERSISTENCE_SECONDARY_NAMESPACE
-		&& key == SCORER_PERSISTENCE_KEY
-	{
-		SCORER_PERSISTENCE_FILE_NAME
-	} else {
-		key
-	}
-}
-
-struct ScorerKeyRemappingStore {
-	inner: Arc<FilesystemStore>,
-}
-
-impl ScorerKeyRemappingStore {
-	fn new(inner: Arc<FilesystemStore>) -> Self {
-		Self { inner }
-	}
-}
-
-impl KVStore for ScorerKeyRemappingStore {
-	fn read(
-		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
-	) -> AsyncResult<'static, Vec<u8>, io::Error> {
-		let key = remap_scorer_key(primary_namespace, secondary_namespace, key);
-		self.inner.read(primary_namespace, secondary_namespace, key)
-	}
-
-	fn write(
-		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
-	) -> AsyncResult<'static, (), io::Error> {
-		let key = remap_scorer_key(primary_namespace, secondary_namespace, key);
-		self.inner.write(primary_namespace, secondary_namespace, key, buf)
-	}
-
-	fn remove(
-		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
-	) -> AsyncResult<'static, (), io::Error> {
-		let key = remap_scorer_key(primary_namespace, secondary_namespace, key);
-		self.inner.remove(primary_namespace, secondary_namespace, key, lazy)
-	}
-
-	fn list(
-		&self, primary_namespace: &str, secondary_namespace: &str,
-	) -> AsyncResult<'static, Vec<String>, io::Error> {
-		self.inner.list(primary_namespace, secondary_namespace)
-	}
-}
-
-fn extract_peer_pubkey(peer: &str) -> Option<&str> {
-	let pubkey = peer.split('@').next().unwrap_or("").trim();
-	if pubkey.is_empty() {
-		None
-	} else {
-		Some(pubkey)
-	}
-}
-
-fn prepare_probe(
-	channel_manager: &ChannelManager, graph: &NetworkGraph, logger: &disk::FilesystemLogger,
-	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<disk::FilesystemLogger>>>,
-	pub_key_hex: &str, probe_amount: u64,
-) -> Result<PaymentHash, ProbeError> {
-	if probe_amount == 0 {
-		return Err(ProbeError::InvalidInput("probe amount must be greater than 0"));
-	}
-	let pub_key_bytes = hex_utils::to_vec(pub_key_hex)
-		.ok_or(ProbeError::InvalidInput("invalid peer pubkey hex"))?;
-	let pk = bitcoin::secp256k1::PublicKey::from_slice(&pub_key_bytes)
-		.map_err(|_| ProbeError::InvalidInput("invalid peer pubkey"))?;
-	send_probe(channel_manager, pk, graph, logger, probe_amount, scorer)
-}
-
-fn send_probe(
-	channel_manager: &ChannelManager, recipient: PublicKey, graph: &NetworkGraph,
-	logger: &disk::FilesystemLogger, amt_msat: u64,
-	scorer: &RwLock<ProbabilisticScorer<Arc<NetworkGraph>, Arc<disk::FilesystemLogger>>>,
-) -> Result<PaymentHash, ProbeError> {
-	let chans = channel_manager.list_usable_channels();
-	let chan_refs = chans.iter().collect::<Vec<_>>();
-	let mut payment_params = PaymentParameters::from_node_id(recipient, 144);
-	payment_params.max_path_count = 1;
-	let in_flight_htlcs = channel_manager.compute_inflight_htlcs();
-	let scorer = scorer.read().unwrap();
-	let inflight_scorer = ScorerAccountingForInFlightHtlcs::new(&scorer, &in_flight_htlcs);
-	let score_params = ProbabilisticScoringFeeParameters {
-		base_penalty_msat: 500_000,
-		base_penalty_amount_multiplier_msat: 131_072 * 3,
-		..Default::default()
-	};
-	let route_res = lightning::routing::router::find_route(
-		&channel_manager.get_our_node_id(),
-		&RouteParameters::from_payment_params_and_value(payment_params, amt_msat),
-		graph,
-		Some(&chan_refs),
-		logger,
-		&inflight_scorer,
-		&score_params,
-		&[32; 32],
-	);
-	let route = route_res.map_err(ProbeError::NoRoute)?;
-	let path = route.paths.into_iter().next().ok_or(ProbeError::NoRoute("route has no paths"))?;
-	let (payment_hash, _) = channel_manager.send_probe(path).map_err(ProbeError::SendFailed)?;
-	Ok(payment_hash)
-}
-
-async fn handle_ldk_events<'a>(
-	channel_manager: Arc<ChannelManager>, bitcoind_client: &'a BitcoindClient,
-	network_graph: &'a NetworkGraph, keys_manager: &'a KeysManager,
-	bump_tx_event_handler: &'a BumpTxEventHandler, peer_manager: Arc<PeerManager>,
-	inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
-	outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>, fs_store: Arc<FilesystemStore>,
-	output_sweeper: OutputSweeperWrapper, network: Network,
-	probe_tracker: Arc<Mutex<ProbeTracker>>, event: Event,
-) {
-	match event {
-		Event::FundingGenerationReady {
-			temporary_channel_id,
-			counterparty_node_id,
-			channel_value_satoshis,
-			output_script,
-			..
-		} => {
-			// Construct the raw transaction with one output, that is paid the amount of the
-			// channel.
-			let addr = WitnessProgram::from_scriptpubkey(
-				output_script.as_bytes(),
-				match network {
-					Network::Bitcoin => bitcoin_bech32::constants::Network::Bitcoin,
-					Network::Regtest => bitcoin_bech32::constants::Network::Regtest,
-					Network::Signet => bitcoin_bech32::constants::Network::Signet,
-					Network::Testnet => bitcoin_bech32::constants::Network::Testnet,
-					_ => bitcoin_bech32::constants::Network::Testnet,
-				},
-			)
-			.expect("Lightning funding tx should always be to a SegWit output")
-			.to_address();
-			let mut outputs = vec![StdHashMap::new()];
-			outputs[0].insert(addr, channel_value_satoshis as f64 / 100_000_000.0);
-			let raw_tx = bitcoind_client.create_raw_transaction(outputs).await;
-
-			// Have your wallet put the inputs into the transaction such that the output is
-			// satisfied.
-			let funded_tx = bitcoind_client.fund_raw_transaction(raw_tx).await;
-
-			// Sign the final funding transaction and give it to LDK, who will eventually broadcast it.
-			let signed_tx = bitcoind_client.sign_raw_transaction_with_wallet(funded_tx.hex).await;
-			assert!(signed_tx.complete);
-			let final_tx: Transaction =
-				encode::deserialize(&hex_utils::to_vec(&signed_tx.hex).unwrap()).unwrap();
-			// Give the funding transaction back to LDK for opening the channel.
-			if channel_manager
-				.funding_transaction_generated(temporary_channel_id, counterparty_node_id, final_tx)
-				.is_err()
-			{
-				println!(
-					"\nERROR: Channel went away before we could fund it. The peer disconnected or refused the channel.");
-				print!("> ");
-				std::io::stdout().flush().unwrap();
-			}
-		},
-		Event::FundingTxBroadcastSafe { .. } => {
-			// We don't use the manual broadcasting feature, so this event should never be seen.
-		},
-		Event::PaymentClaimable { payment_hash, purpose, amount_msat, .. } => {
-			println!(
-				"\nEVENT: received payment from payment hash {} of {} millisatoshis",
-				payment_hash, amount_msat,
-			);
-			print!("> ");
-			std::io::stdout().flush().unwrap();
-			let payment_preimage = match purpose {
-				PaymentPurpose::Bolt11InvoicePayment { payment_preimage, .. } => payment_preimage,
-				PaymentPurpose::Bolt12OfferPayment { payment_preimage, .. } => payment_preimage,
-				PaymentPurpose::Bolt12RefundPayment { payment_preimage, .. } => payment_preimage,
-				PaymentPurpose::SpontaneousPayment(preimage) => Some(preimage),
-			};
-			channel_manager.claim_funds(payment_preimage.unwrap());
-		},
-		Event::PaymentClaimed { payment_hash, purpose, amount_msat, .. } => {
-			println!(
-				"\nEVENT: claimed payment from payment hash {} of {} millisatoshis",
-				payment_hash, amount_msat,
-			);
-			print!("> ");
-			std::io::stdout().flush().unwrap();
-			let (payment_preimage, payment_secret) = match purpose {
-				PaymentPurpose::Bolt11InvoicePayment {
-					payment_preimage, payment_secret, ..
-				} => (payment_preimage, Some(payment_secret)),
-				PaymentPurpose::Bolt12OfferPayment { payment_preimage, payment_secret, .. } => {
-					(payment_preimage, Some(payment_secret))
-				},
-				PaymentPurpose::Bolt12RefundPayment {
-					payment_preimage, payment_secret, ..
-				} => (payment_preimage, Some(payment_secret)),
-				PaymentPurpose::SpontaneousPayment(preimage) => (Some(preimage), None),
-			};
-			let write_future = {
-				let mut inbound = inbound_payments.lock().unwrap();
-				match inbound.payments.entry(payment_hash) {
-					Entry::Occupied(mut e) => {
-						let payment = e.get_mut();
-						payment.status = HTLCStatus::Succeeded;
-						payment.preimage = payment_preimage;
-						payment.secret = payment_secret;
-					},
-					Entry::Vacant(e) => {
-						e.insert(PaymentInfo {
-							preimage: payment_preimage,
-							secret: payment_secret,
-							status: HTLCStatus::Succeeded,
-							amt_msat: MillisatAmount(Some(amount_msat)),
-						});
-					},
-				}
-				fs_store.write("", "", INBOUND_PAYMENTS_FNAME, inbound.encode())
-			};
-			write_future.await.unwrap();
-		},
-		Event::PaymentSent {
-			payment_preimage, payment_hash, fee_paid_msat, payment_id, ..
-		} => {
-			let write_future = {
-				let mut outbound = outbound_payments.lock().unwrap();
-				for (id, payment) in outbound.payments.iter_mut() {
-					if *id == payment_id.unwrap() {
-						payment.preimage = Some(payment_preimage);
-						payment.status = HTLCStatus::Succeeded;
-						println!(
-							"\nEVENT: successfully sent payment of {} millisatoshis{} from \
-									 payment hash {} with preimage {}",
-							payment.amt_msat,
-							if let Some(fee) = fee_paid_msat {
-								format!(" (fee {} msat)", fee)
-							} else {
-								"".to_string()
-							},
-							payment_hash,
-							payment_preimage
-						);
-						print!("> ");
-						std::io::stdout().flush().unwrap();
-					}
-				}
-				fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound.encode())
-			};
-			write_future.await.unwrap();
-		},
-		Event::OpenChannelRequest {
-			ref temporary_channel_id, ref counterparty_node_id, ..
-		} => {
-			let mut random_bytes = [0u8; 16];
-			random_bytes.copy_from_slice(&keys_manager.get_secure_random_bytes()[..16]);
-			let user_channel_id = u128::from_be_bytes(random_bytes);
-			let res = channel_manager.accept_inbound_channel(
-				temporary_channel_id,
-				counterparty_node_id,
-				user_channel_id,
-				None,
-			);
-
-			if let Err(e) = res {
-				print!(
-					"\nEVENT: Failed to accept inbound channel ({}) from {}: {:?}",
-					temporary_channel_id,
-					hex_utils::hex_str(&counterparty_node_id.serialize()),
-					e,
-				);
-			} else {
-				print!(
-					"\nEVENT: Accepted inbound channel ({}) from {}",
-					temporary_channel_id,
-					hex_utils::hex_str(&counterparty_node_id.serialize()),
-				);
-			}
-			print!("> ");
-			std::io::stdout().flush().unwrap();
-		},
-		Event::PaymentPathSuccessful { .. } => {},
-		Event::PaymentPathFailed { .. } => {},
-		Event::ProbeSuccessful { payment_hash, .. } => {
-			probe_tracker.lock().unwrap().complete_probe(&payment_hash, ProbeOutcome::Success);
-		},
-		Event::ProbeFailed { payment_hash, .. } => {
-			probe_tracker.lock().unwrap().complete_probe(&payment_hash, ProbeOutcome::Failed);
-		},
-		Event::PaymentFailed { payment_hash, reason, payment_id, .. } => {
-			if let Some(hash) = payment_hash {
-				print!(
-					"\nEVENT: Failed to send payment to payment ID {}, payment hash {}: {:?}",
-					payment_id,
-					hash,
-					if let Some(r) = reason { r } else { PaymentFailureReason::RetriesExhausted }
-				);
-			} else {
-				print!(
-					"\nEVENT: Failed fetch invoice for payment ID {}: {:?}",
-					payment_id,
-					if let Some(r) = reason { r } else { PaymentFailureReason::RetriesExhausted }
-				);
-			}
-			print!("> ");
-			std::io::stdout().flush().unwrap();
-
-			let write_future = {
-				let mut outbound = outbound_payments.lock().unwrap();
-				if outbound.payments.contains_key(&payment_id) {
-					let payment = outbound.payments.get_mut(&payment_id).unwrap();
-					payment.status = HTLCStatus::Failed;
-				}
-				fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound.encode())
-			};
-			write_future.await.unwrap();
-		},
-		Event::InvoiceReceived { .. } => {
-			// We don't use the manual invoice payment logic, so this event should never be seen.
-		},
-		Event::PaymentForwarded {
-			prev_channel_id,
-			next_channel_id,
-			total_fee_earned_msat,
-			claim_from_onchain_tx,
-			outbound_amount_forwarded_msat,
-			..
-		} => {
-			let read_only_network_graph = network_graph.read_only();
-			let nodes = read_only_network_graph.nodes();
-			let channels = channel_manager.list_channels();
-
-			let node_str = |channel_id: &Option<ChannelId>| match channel_id {
-				None => String::new(),
-				Some(channel_id) => match channels.iter().find(|c| c.channel_id == *channel_id) {
-					None => String::new(),
-					Some(channel) => {
-						match nodes.get(&NodeId::from_pubkey(&channel.counterparty.node_id)) {
-							None => "private node".to_string(),
-							Some(node) => match &node.announcement_info {
-								None => "unnamed node".to_string(),
-								Some(announcement) => {
-									format!("node {}", announcement.alias())
-								},
-							},
-						}
-					},
-				},
-			};
-			let channel_str = |channel_id: &Option<ChannelId>| {
-				channel_id
-					.map(|channel_id| format!(" with channel {}", channel_id))
-					.unwrap_or_default()
-			};
-			let from_prev_str =
-				format!(" from {}{}", node_str(&prev_channel_id), channel_str(&prev_channel_id),);
-			let to_next_str =
-				format!(" to {}{}", node_str(&next_channel_id), channel_str(&next_channel_id));
-
-			let from_onchain_str = if claim_from_onchain_tx {
-				"from onchain downstream claim"
-			} else {
-				"from HTLC fulfill message"
-			};
-			let amt_args = if let Some(v) = outbound_amount_forwarded_msat {
-				format!("{}", v)
-			} else {
-				"?".to_string()
-			};
-			if let Some(fee_earned) = total_fee_earned_msat {
-				println!(
-					"\nEVENT: Forwarded payment for {} msat{}{}, earning {} msat {}",
-					amt_args, from_prev_str, to_next_str, fee_earned, from_onchain_str
-				);
-			} else {
-				println!(
-					"\nEVENT: Forwarded payment for {} msat{}{}, claiming onchain {}",
-					amt_args, from_prev_str, to_next_str, from_onchain_str
-				);
-			}
-			print!("> ");
-			std::io::stdout().flush().unwrap();
-		},
-		Event::HTLCHandlingFailed { .. } => {},
-		Event::SpendableOutputs { outputs, channel_id } => {
-			output_sweeper
-				.0
-				.track_spendable_outputs(outputs, channel_id, false, None)
-				.await
-				.unwrap();
-		},
-		Event::ChannelPending { channel_id, counterparty_node_id, .. } => {
-			println!(
-				"\nEVENT: Channel {} with peer {} is pending awaiting funding lock-in!",
-				channel_id,
-				hex_utils::hex_str(&counterparty_node_id.serialize()),
-			);
-			print!("> ");
-			std::io::stdout().flush().unwrap();
-		},
-		Event::ChannelReady { ref channel_id, ref counterparty_node_id, .. } => {
-			println!(
-				"\nEVENT: Channel {} with peer {} is ready to be used!",
-				channel_id,
-				hex_utils::hex_str(&counterparty_node_id.serialize()),
-			);
-			print!("> ");
-			std::io::stdout().flush().unwrap();
-		},
-		Event::ChannelClosed { channel_id, reason, counterparty_node_id, .. } => {
-			println!(
-				"\nEVENT: Channel {} with counterparty {} closed due to: {:?}",
-				channel_id,
-				counterparty_node_id.map(|id| format!("{}", id)).unwrap_or("".to_owned()),
-				reason
-			);
-			print!("> ");
-			std::io::stdout().flush().unwrap();
-		},
-		Event::DiscardFunding { .. } => {
-			// A "real" node should probably "lock" the UTXOs spent in funding transactions until
-			// the funding transaction either confirms, or this event is generated.
-		},
-		Event::HTLCIntercepted { .. } => {},
-		Event::OnionMessageIntercepted { .. } => {
-			// We don't use the onion message interception feature, so this event should never be
-			// seen.
-		},
-		Event::OnionMessagePeerConnected { .. } => {
-			// We don't use the onion message interception feature, so we have no use for this
-			// event.
-		},
-		Event::BumpTransaction(event) => bump_tx_event_handler.handle_event(&event).await,
-		Event::ConnectionNeeded { node_id, addresses } => {
-			tokio::spawn(async move {
-				for address in addresses {
-					if let Ok(sockaddrs) = address.to_socket_addrs() {
-						for addr in sockaddrs {
-							let pm = Arc::clone(&peer_manager);
-							if cli::connect_peer_if_necessary(node_id, addr, pm).await.is_ok() {
-								return;
-							}
-						}
-					}
-				}
-			});
-		},
-		_ => {},
-	}
-}
-
 async fn start_ldk() {
 	let args = match args::parse_startup_args() {
 		Ok(user_args) => user_args,
-		Err(()) => return,
+		Err(args::StartupArgsError::MissingStorageDirectory) => {
+			let argv0 = std::env::args().next().unwrap_or_else(|| "ldk-sample".to_string());
+			println!("Usage: {} <ldk_storage_directory_path>", argv0);
+			println!();
+			println!(
+				"The config.toml file should be located at <ldk_storage_directory_path>/.ldk/config.toml",
+			);
+			crate::config::print_config_help();
+			return;
+		},
+		Err(args::StartupArgsError::Config(config_err)) => {
+			println!("ERROR: {}", config_err);
+			if matches!(
+				config_err,
+				config::ConfigError::FileNotFound(_)
+					| config::ConfigError::DeprecatedJsonConfig(_)
+					| config::ConfigError::ParseError(_)
+			) {
+				println!();
+				crate::config::print_config_help();
+			}
+			return;
+		},
+		Err(e) => {
+			println!("ERROR: {}", e);
+			return;
+		},
 	};
 
 	// Initialize the LDK data directory if necessary.
 	let ldk_data_dir = format!("{}/.ldk", args.ldk_storage_dir_path);
-	fs::create_dir_all(ldk_data_dir.clone()).unwrap();
+	if let Err(e) = fs::create_dir_all(ldk_data_dir.clone()) {
+		println!("ERROR: Failed to create LDK data directory {}: {}", ldk_data_dir, e);
+		return;
+	}
 
 	// ## Setup
 	// Step 1: Initialize the Logger
-	let logger = Arc::new(FilesystemLogger::new(ldk_data_dir.clone()));
+	//
+	// This is the earliest thing that can fail *after* the data directory
+	// exists, and the error path here is the ONLY one that is allowed to
+	// `println!` an error message, because no logger is available yet to
+	// receive it. All subsequent bootstrap errors route through the logger
+	// as well as stdout via the `user_err!` macro (see `src/logging.rs`).
+	let logger = match FilesystemLogger::try_new(ldk_data_dir.clone()) {
+		Ok(l) => Arc::new(l),
+		Err(e) => {
+			println!(
+				"ERROR: Failed to initialise filesystem logger at {}/logs: {}",
+				ldk_data_dir, e
+			);
+			return;
+		},
+	};
 
 	// Initialize our bitcoind client.
 	let bitcoind_client = match BitcoindClient::new(
@@ -740,13 +152,19 @@ async fn start_ldk() {
 	{
 		Ok(client) => Arc::new(client),
 		Err(e) => {
-			println!("Failed to connect to bitcoind client: {}", e);
+			user_err!(&*logger, "Failed to connect to bitcoind client: {}", e);
 			return;
 		},
 	};
 
 	// Check that the bitcoind we've connected to is running the network we expect
-	let bitcoind_chain = bitcoind_client.get_blockchain_info().await.chain;
+	let bitcoind_chain = match bitcoind_client.get_blockchain_info().await {
+		Ok(info) => info.chain,
+		Err(e) => {
+			user_err!(&*logger, "Failed to fetch bitcoind chain info: {}", e);
+			return;
+		},
+	};
 	if bitcoind_chain
 		!= match args.network {
 			bitcoin::Network::Bitcoin => "main",
@@ -755,9 +173,11 @@ async fn start_ldk() {
 			bitcoin::Network::Testnet => "test",
 			_ => "test",
 		} {
-		println!(
+		user_err!(
+			&*logger,
 			"Chain argument ({}) didn't match bitcoind chain ({})",
-			args.network, bitcoind_chain
+			args.network,
+			bitcoind_chain
 		);
 		return;
 	}
@@ -779,7 +199,15 @@ async fn start_ldk() {
 	// other secret key material.
 	let keys_seed_path = format!("{}/keys_seed", ldk_data_dir.clone());
 	let keys_seed = if let Ok(seed) = fs::read(keys_seed_path.clone()) {
-		assert_eq!(seed.len(), 32);
+		if seed.len() != 32 {
+			user_err!(
+				&*logger,
+				"Invalid keys seed length in {}. Expected 32 bytes, found {}.",
+				keys_seed_path,
+				seed.len()
+			);
+			return;
+		}
 		let mut key = [0; 32];
 		key.copy_from_slice(&seed);
 		key
@@ -788,18 +216,29 @@ async fn start_ldk() {
 		thread_rng().fill_bytes(&mut key);
 		match File::create(keys_seed_path.clone()) {
 			Ok(mut f) => {
-				std::io::Write::write_all(&mut f, &key)
-					.expect("Failed to write node keys seed to disk");
-				f.sync_all().expect("Failed to sync node keys seed to disk");
+				if let Err(e) = std::io::Write::write_all(&mut f, &key) {
+					user_err!(&*logger, "Failed to write node keys seed to disk: {}", e);
+					return;
+				}
+				if let Err(e) = f.sync_all() {
+					user_err!(&*logger, "Failed to sync node keys seed to disk: {}", e);
+					return;
+				}
 			},
 			Err(e) => {
-				println!("ERROR: Unable to create keys seed file {}: {}", keys_seed_path, e);
+				user_err!(&*logger, "Unable to create keys seed file {}: {}", keys_seed_path, e);
 				return;
 			},
 		}
 		key
 	};
-	let cur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+	let cur = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+		Ok(d) => d,
+		Err(e) => {
+			user_err!(&*logger, "System clock appears to be before UNIX_EPOCH: {}", e);
+			return;
+		},
+	};
 	let keys_manager =
 		Arc::new(KeysManager::new(&keys_seed, cur.as_secs(), cur.subsec_nanos(), true));
 
@@ -827,7 +266,13 @@ async fn start_ldk() {
 	//let persister = Arc::clone(&fs_store);
 
 	// Step 6: Read ChannelMonitor state from disk
-	let mut channelmonitors = persister.read_all_channel_monitors_with_updates().unwrap();
+	let mut channelmonitors = match persister.read_all_channel_monitors_with_updates() {
+		Ok(monitors) => monitors,
+		Err(e) => {
+			user_err!(&*logger, "Failed to read channel monitors from disk: {}", e);
+			return;
+		},
+	};
 	// If you are using the `FilesystemStore` as a `Persist` directly, use
 	// `lightning::util::persist::read_channel_monitors` like this:
 	// read_channel_monitors(Arc::clone(&persister), Arc::clone(&keys_manager), Arc::clone(&keys_manager)).unwrap();
@@ -844,9 +289,13 @@ async fn start_ldk() {
 	));
 
 	// Step 8: Poll for the best chain tip, which may be used by the channel manager & spv client
-	let polled_chain_tip = init::validate_best_block_header(bitcoind_client.as_ref())
-		.await
-		.expect("Failed to fetch best block header and best block");
+	let polled_chain_tip = match init::validate_best_block_header(bitcoind_client.as_ref()).await {
+		Ok(tip) => tip,
+		Err(e) => {
+			user_err!(&*logger, "Failed to fetch best block header and best block: {:?}", e);
+			return;
+		},
+	};
 
 	// Step 9: Initialize routing ProbabilisticScorer
 	let network_graph_path = format!("{}/network_graph", ldk_data_dir.clone());
@@ -871,7 +320,7 @@ async fn start_ldk() {
 		logger.clone(),
 		keys_manager.clone(),
 		scorer.clone(),
-		scoring_fee_params,
+		scoring_fee_params.clone(),
 	));
 
 	let message_router =
@@ -902,7 +351,13 @@ async fn start_ldk() {
 				user_config,
 				channel_monitor_references,
 			);
-			<(BlockHash, ChannelManager)>::read(&mut BufReader::new(f), read_args).unwrap()
+			match <(BlockHash, ChannelManager)>::read(&mut BufReader::new(f), read_args) {
+				Ok(v) => v,
+				Err(e) => {
+					user_err!(&*logger, "Failed to deserialize channel manager: {:?}", e);
+					return;
+				},
+			}
 		} else {
 			// We're starting a fresh node.
 			restarting_node = false;
@@ -962,10 +417,18 @@ async fn start_ldk() {
 				logger.clone(),
 			);
 			let mut reader = io::Cursor::new(&mut bytes);
-			<(BestBlock, OutputSweeper)>::read(&mut reader, read_args)
-				.expect("Failed to deserialize OutputSweeper")
+			match <(BestBlock, OutputSweeper)>::read(&mut reader, read_args) {
+				Ok(v) => v,
+				Err(e) => {
+					user_err!(&*logger, "Failed to deserialize OutputSweeper: {:?}", e);
+					return;
+				},
+			}
 		},
-		Err(e) => panic!("Failed to read OutputSweeper with {}", e),
+		Err(e) => {
+			user_err!(&*logger, "Failed to read OutputSweeper: {}", e);
+			return;
+		},
 	};
 
 	// Step 13: Sync ChannelMonitors, ChannelManager and OutputSweeper to chain tip
@@ -993,14 +456,20 @@ async fn start_ldk() {
 			));
 		}
 
-		init::synchronize_listeners(
+		match init::synchronize_listeners(
 			bitcoind_client.as_ref(),
 			args.network,
 			&mut cache,
 			chain_listeners,
 		)
 		.await
-		.unwrap()
+		{
+			Ok(tip) => tip,
+			Err(e) => {
+				user_err!(&*logger, "Failed to synchronize chain listeners: {:?}", e);
+				return;
+			},
+		}
 	} else {
 		polled_chain_tip
 	};
@@ -1010,10 +479,12 @@ async fn start_ldk() {
 		let channel_id = channel_monitor.channel_id();
 		// Note that this may not return `Completed` for ChannelMonitors which were last written by
 		// a version of LDK prior to 0.1.
-		assert_eq!(
-			chain_monitor.load_existing_monitor(channel_id, channel_monitor),
-			Ok(ChannelMonitorUpdateStatus::Completed)
-		);
+		if chain_monitor.load_existing_monitor(channel_id, channel_monitor)
+			!= Ok(ChannelMonitorUpdateStatus::Completed)
+		{
+			user_err!(&*logger, "Failed to load existing monitor for channel {}", channel_id);
+			return;
+		}
 	}
 
 	// Step 15: Initialize RapidGossipSync if enabled
@@ -1027,7 +498,6 @@ async fn start_ldk() {
 		match rapid_sync::RapidGossipSyncManager::new(
 			Arc::clone(&network_graph),
 			args.rapid_gossip_sync_url.clone(),
-			Arc::clone(&fs_store),
 			Arc::clone(&logger),
 			ldk_data_dir.clone(),
 		)
@@ -1061,7 +531,19 @@ async fn start_ldk() {
 	// messages. Doing this only makes sense for a always-online public routing node, and doesn't
 	// provide you any direct value, but its nice to offer the service for others.
 	let channel_manager: Arc<ChannelManager> = Arc::new(channel_manager);
-	let resolver = "8.8.8.8:53".to_socket_addrs().unwrap().next().unwrap();
+	let resolver = match "8.8.8.8:53".to_socket_addrs() {
+		Ok(mut addrs) => match addrs.next() {
+			Some(addr) => addr,
+			None => {
+				user_err!(&*logger, "Resolver address lookup returned no addresses");
+				return;
+			},
+		},
+		Err(e) => {
+			user_err!(&*logger, "Failed to resolve default DNS resolver: {}", e);
+			return;
+		},
+	};
 	let domain_resolver =
 		Arc::new(OMDomainResolver::new(resolver, Some(Arc::clone(&channel_manager))));
 
@@ -1078,7 +560,13 @@ async fn start_ldk() {
 		IgnoringMessageHandler {},
 	));
 	let mut ephemeral_bytes = [0; 32];
-	let current_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+	let current_time = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+		Ok(d) => d.as_secs(),
+		Err(e) => {
+			user_err!(&*logger, "System clock appears to be before UNIX_EPOCH: {}", e);
+			return;
+		},
+	};
 	rand::thread_rng().fill_bytes(&mut ephemeral_bytes);
 	let lightning_msg_handler = MessageHandler {
 		chan_handler: Arc::clone(&channel_manager),
@@ -1089,7 +577,13 @@ async fn start_ldk() {
 	};
 	let peer_manager: Arc<PeerManager> = Arc::new(PeerManager::new(
 		lightning_msg_handler,
-		current_time.try_into().unwrap(),
+		match current_time.try_into() {
+			Ok(ts) => ts,
+			Err(_) => {
+				user_err!(&*logger, "Current timestamp does not fit expected peer-manager type");
+				return;
+			},
+		},
 		&ephemeral_bytes,
 		logger.clone(),
 		Arc::clone(&keys_manager),
@@ -1111,28 +605,54 @@ async fn start_ldk() {
 	let listening_port = args.ldk_peer_listening_port;
 	let stop_listen_connect = Arc::new(AtomicBool::new(false));
 	let stop_listen = Arc::clone(&stop_listen_connect);
+	let listen_logger = Arc::clone(&logger);
 	tokio::spawn(async move {
-		let listener = tokio::net::TcpListener::bind(format!("[::]:{}", listening_port))
-			.await
-			.expect("Failed to bind to listen port - is something else already listening on it?");
+		let listener = match tokio::net::TcpListener::bind(format!("[::]:{}", listening_port)).await
+		{
+			Ok(listener) => listener,
+			Err(e) => {
+				// Listener bind failures are fatal for inbound connectivity;
+				// surface via the dual-output macro so operators see the
+				// message whether they run with or without a terminal.
+				user_err!(
+					&*listen_logger,
+					"Failed to bind to listen port {} - is something else already listening on it? {}",
+					listening_port,
+					e
+				);
+				return;
+			},
+		};
 		loop {
 			let peer_mgr = peer_manager_connection_handler.clone();
 			let (tcp_stream, _) = match listener.accept().await {
 				Ok(conn) => conn,
 				Err(e) => {
-					eprintln!("Failed to accept inbound connection: {}", e);
+					lightning::log_warn!(
+						&*listen_logger,
+						"Failed to accept inbound connection: {}",
+						e
+					);
 					continue;
 				},
 			};
 			if stop_listen.load(Ordering::Acquire) {
 				return;
 			}
+			let conn_logger = Arc::clone(&listen_logger);
 			tokio::spawn(async move {
-				lightning_net_tokio::setup_inbound(
-					peer_mgr.clone(),
-					tcp_stream.into_std().unwrap(),
-				)
-				.await;
+				match tcp_stream.into_std() {
+					Ok(std_stream) => {
+						lightning_net_tokio::setup_inbound(peer_mgr.clone(), std_stream).await;
+					},
+					Err(e) => {
+						lightning::log_warn!(
+							&*conn_logger,
+							"Failed to convert inbound TCP stream: {}",
+							e
+						);
+					},
+				}
 			});
 		}
 	});
@@ -1180,12 +700,18 @@ async fn start_ldk() {
 		}
 	});
 
-	let inbound_payments = Arc::new(Mutex::new(disk::read_inbound_payment_info(Path::new(
-		&format!("{}/{}", ldk_data_dir, INBOUND_PAYMENTS_FNAME),
-	))));
-	let outbound_payments = Arc::new(Mutex::new(disk::read_outbound_payment_info(Path::new(
-		&format!("{}/{}", ldk_data_dir, OUTBOUND_PAYMENTS_FNAME),
-	))));
+	// Phase 4: payment storage now uses `tokio::sync::Mutex`. The lock
+	// helper returns a guard directly (not a Result), because a
+	// tokio-mutex cannot be poisoned — there's no panic-propagation path
+	// through an `.await` in the way there is for `std::sync::Mutex`.
+	let inbound_payments = Arc::new(tokio::sync::Mutex::new(disk::read_inbound_payment_info(
+		Path::new(&format!("{}/{}", ldk_data_dir, INBOUND_PAYMENTS_FNAME)),
+		&logger,
+	)));
+	let outbound_payments = Arc::new(tokio::sync::Mutex::new(disk::read_outbound_payment_info(
+		Path::new(&format!("{}/{}", ldk_data_dir, OUTBOUND_PAYMENTS_FNAME)),
+		&logger,
+	)));
 	let recent_payments_payment_ids = channel_manager
 		.list_recent_payments()
 		.into_iter()
@@ -1196,64 +722,48 @@ async fn start_ldk() {
 			RecentPaymentDetails::AwaitingInvoice { payment_id } => payment_id,
 		})
 		.collect::<Vec<PaymentId>>();
-	for (payment_id, payment_info) in outbound_payments
-		.lock()
-		.unwrap()
-		.payments
-		.iter_mut()
-		.filter(|(_, i)| matches!(i.status, HTLCStatus::Pending))
 	{
-		if !recent_payments_payment_ids.contains(payment_id) {
-			payment_info.status = HTLCStatus::Failed;
+		let mut outbound_payments_lock = outbound_payments.lock().await;
+		for (payment_id, payment_info) in outbound_payments_lock
+			.payments
+			.iter_mut()
+			.filter(|(_, i)| matches!(i.status, HTLCStatus::Pending))
+		{
+			if !recent_payments_payment_ids.contains(payment_id) {
+				payment_info.status = HTLCStatus::Failed;
+			}
 		}
 	}
-	fs_store
-		.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments.lock().unwrap().encode())
-		.await
-		.unwrap();
+	let outbound_payments_bytes = {
+		let outbound_payments_lock = outbound_payments.lock().await;
+		outbound_payments_lock.encode()
+	};
+	if let Err(e) = fs_store.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments_bytes).await {
+		user_err!(&*logger, "Failed to persist outbound payments: {}", e);
+		return;
+	}
 
 	// Step 20: Handle LDK Events
-	let channel_manager_event_listener = Arc::clone(&channel_manager);
-	let bitcoind_client_event_listener = Arc::clone(&bitcoind_client);
-	let network_graph_event_listener = Arc::clone(&network_graph);
-	let keys_manager_event_listener = Arc::clone(&keys_manager);
-	let inbound_payments_event_listener = Arc::clone(&inbound_payments);
-	let outbound_payments_event_listener = Arc::clone(&outbound_payments);
-	let fs_store_event_listener = Arc::clone(&fs_store);
-	let peer_manager_event_listener = Arc::clone(&peer_manager);
-	let output_sweeper_event_listener = Arc::clone(&output_sweeper);
-	let probe_tracker = Arc::new(Mutex::new(ProbeTracker::new()));
-	let probe_tracker_event_listener = Arc::clone(&probe_tracker);
-	let network = args.network;
+	let probe_tracker = Arc::new(Mutex::new(probing::ProbeTracker::new()));
+	let event_context = Arc::new(events::EventContext {
+		channel_manager: Arc::clone(&channel_manager),
+		bitcoind_client: Arc::clone(&bitcoind_client),
+		network_graph: Arc::clone(&network_graph),
+		keys_manager: Arc::clone(&keys_manager),
+		bump_tx_event_handler: Arc::clone(&bump_tx_event_handler),
+		peer_manager: Arc::clone(&peer_manager),
+		inbound_payments: Arc::clone(&inbound_payments),
+		outbound_payments: Arc::clone(&outbound_payments),
+		fs_store: Arc::clone(&fs_store),
+		output_sweeper: Arc::clone(&output_sweeper),
+		network: args.network,
+		probe_tracker: Arc::clone(&probe_tracker),
+		logger: Arc::clone(&logger),
+	});
 	let event_handler = move |event: Event| {
-		let channel_manager_event_listener = Arc::clone(&channel_manager_event_listener);
-		let bitcoind_client_event_listener = Arc::clone(&bitcoind_client_event_listener);
-		let network_graph_event_listener = Arc::clone(&network_graph_event_listener);
-		let keys_manager_event_listener = Arc::clone(&keys_manager_event_listener);
-		let bump_tx_event_handler = Arc::clone(&bump_tx_event_handler);
-		let inbound_payments_event_listener = Arc::clone(&inbound_payments_event_listener);
-		let outbound_payments_event_listener = Arc::clone(&outbound_payments_event_listener);
-		let fs_store_event_listener = Arc::clone(&fs_store_event_listener);
-		let peer_manager_event_listener = Arc::clone(&peer_manager_event_listener);
-		let output_sweeper_event_listener = Arc::clone(&output_sweeper_event_listener);
-		let probe_tracker_event_listener = Arc::clone(&probe_tracker_event_listener);
+		let event_context = Arc::clone(&event_context);
 		async move {
-			handle_ldk_events(
-				channel_manager_event_listener,
-				&bitcoind_client_event_listener,
-				&network_graph_event_listener,
-				&keys_manager_event_listener,
-				&bump_tx_event_handler,
-				peer_manager_event_listener,
-				inbound_payments_event_listener,
-				outbound_payments_event_listener,
-				fs_store_event_listener,
-				OutputSweeperWrapper(output_sweeper_event_listener),
-				network,
-				probe_tracker_event_listener,
-				event,
-			)
-			.await;
+			events::handle_ldk_events(event_context, event).await;
 			Ok(())
 		}
 	};
@@ -1282,7 +792,7 @@ async fn start_ldk() {
 			})
 		},
 		false,
-		|| Some(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap()),
+		|| SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok(),
 	));
 
 	// Regularly reconnect to channel peers.
@@ -1320,11 +830,11 @@ async fn start_ldk() {
 					Vec::new()
 				};
 				for addr in addrs {
-					let sockaddrs = addr.to_socket_addrs();
-					if sockaddrs.is_err() {
-						continue;
-					}
-					for sockaddr in sockaddrs.unwrap() {
+					let sockaddrs = match addr.to_socket_addrs() {
+						Ok(addrs) => addrs,
+						Err(_) => continue,
+					};
+					for sockaddr in sockaddrs {
 						let _ =
 							cli::do_connect_peer(node_id, sockaddr, Arc::clone(&connect_pm)).await;
 					}
@@ -1458,228 +968,18 @@ async fn start_ldk() {
 	));
 
 	// Regularly probe (if probing config is present)
-	let probing_cm = Arc::clone(&channel_manager);
-	let probing_graph = Arc::clone(&network_graph);
-	let probing_logger = Arc::clone(&logger);
-	let probing_scorer = Arc::clone(&scorer);
-	let probing_tracker = Arc::clone(&probe_tracker);
 	if let Some(probe_config) = probing_config {
-		if probe_config.peers.is_empty() {
-			println!("WARNING: probing.peers is empty in config.toml. Probing disabled.");
-		} else if probe_config.amount_msats.is_empty() {
-			println!("WARNING: probing.amount_msats is empty in config.toml. Probing disabled.");
-		} else {
-			// Sort amounts ascending (smallest to largest)
-			let mut sorted_amounts = probe_config.amount_msats.clone();
-			sorted_amounts.sort();
-
-			let probe_timeout = Duration::from_secs(probe_config.timeout_sec);
-			let probe_delay = Duration::from_secs(probe_config.probe_delay_sec);
-			let peer_delay = Duration::from_secs(probe_config.peer_delay_sec);
-
-			// Log startup configuration
-			lightning::log_info!(
-				&*probing_logger,
-				"Probing started: {} peers, {} amounts {:?} msat, interval={}s, timeout={}s, probe_delay={}s, peer_delay={}s",
-				probe_config.peers.len(),
-				sorted_amounts.len(),
-				sorted_amounts,
-				probe_config.interval_sec,
-				probe_config.timeout_sec,
-				probe_config.probe_delay_sec,
-				probe_config.peer_delay_sec
-			);
-
-			tokio::spawn(async move {
-				let mut interval =
-					tokio::time::interval(Duration::from_secs(probe_config.interval_sec));
-				loop {
-					interval.tick().await;
-
-					// Probe each peer with amounts from smallest to largest
-					let peer_count = probe_config.peers.len();
-					for (peer_idx, peer) in probe_config.peers.iter().enumerate() {
-						let Some(peer_pubkey) = extract_peer_pubkey(peer) else {
-							lightning::log_warn!(
-								&*probing_logger,
-								"Probe skipped: invalid peer entry '{}' (expected pubkey@host:port or pubkey)",
-								peer
-							);
-							continue;
-						};
-						'amounts: for &amount in &sorted_amounts {
-							// Send the probe and get the payment hash
-							let payment_hash = prepare_probe(
-								&probing_cm,
-								&probing_graph,
-								&probing_logger,
-								&probing_scorer,
-								peer_pubkey,
-								amount,
-							);
-
-							match payment_hash {
-								Ok(hash) => {
-									lightning::log_info!(
-										&*probing_logger,
-										"Probe SENT to {} for {} msat (hash: {})",
-										peer_pubkey,
-										amount,
-										hash
-									);
-
-									// Register the probe and get a receiver for the outcome
-									let rx = probing_tracker.lock().unwrap().register_probe(hash);
-
-									// Wait for the probe outcome with timeout
-									let outcome = tokio::time::timeout(probe_timeout, rx).await;
-
-									match outcome {
-										Ok(Ok(ProbeOutcome::Success)) => {
-											lightning::log_info!(
-												&*probing_logger,
-												"Probe SUCCESS to {} for {} msat (hash: {})",
-												peer_pubkey,
-												amount,
-												hash
-											);
-											lightning::log_info!(
-												&*probing_logger,
-												"probe_completed destination_node={} amount_msat={} state=SUCCESS payment_hash={}",
-												peer_pubkey,
-												amount,
-												hash
-											);
-											// Probe succeeded, sleep before next amount
-											tokio::time::sleep(probe_delay).await;
-										},
-										Ok(Ok(ProbeOutcome::Failed)) => {
-											lightning::log_warn!(
-												&*probing_logger,
-												"Probe FAILED to {} for {} msat (hash: {}), skipping remaining amounts",
-												peer_pubkey,
-												amount,
-												hash
-											);
-											lightning::log_warn!(
-												&*probing_logger,
-												"probe_completed destination_node={} amount_msat={} state=FAILED payment_hash={}",
-												peer_pubkey,
-												amount,
-												hash
-											);
-											tokio::time::sleep(probe_delay).await;
-											break 'amounts;
-										},
-										Ok(Err(_)) => {
-											lightning::log_warn!(
-												&*probing_logger,
-												"Probe DROPPED to {} for {} msat (hash: {}), channel closed, skipping remaining amounts",
-												peer_pubkey,
-												amount,
-												hash
-											);
-											lightning::log_warn!(
-												&*probing_logger,
-												"probe_completed destination_node={} amount_msat={} state=DROPPED payment_hash={}",
-												peer_pubkey,
-												amount,
-												hash
-											);
-											tokio::time::sleep(probe_delay).await;
-											break 'amounts;
-										},
-										Err(_) => {
-											lightning::log_warn!(
-												&*probing_logger,
-												"Probe TIMEOUT to {} for {} msat (hash: {}), skipping remaining amounts",
-												peer_pubkey,
-												amount,
-												hash
-											);
-											lightning::log_warn!(
-												&*probing_logger,
-												"probe_completed destination_node={} amount_msat={} state=TIMEOUT payment_hash={}",
-												peer_pubkey,
-												amount,
-												hash
-											);
-											// Clean up the pending probe to avoid memory leak
-											probing_tracker
-												.lock()
-												.unwrap()
-												.pending_probes
-												.remove(&hash);
-											tokio::time::sleep(probe_delay).await;
-											break 'amounts;
-										},
-									}
-								},
-								Err(ProbeError::NoRoute(err)) => {
-									lightning::log_warn!(
-										&*probing_logger,
-										"Probe NO_ROUTE to {} for {} msat (error: {}), skipping remaining amounts",
-										peer_pubkey,
-										amount,
-										err
-									);
-									lightning::log_warn!(
-										&*probing_logger,
-										"probe_completed destination_node={} amount_msat={} state=NO_ROUTE error={}",
-										peer_pubkey,
-										amount,
-										err
-									);
-									tokio::time::sleep(probe_delay).await;
-									break 'amounts;
-								},
-								Err(ProbeError::SendFailed(err)) => {
-									lightning::log_warn!(
-										&*probing_logger,
-										"Probe SEND_FAILED to {} for {} msat (error: {:?}), skipping remaining amounts",
-										peer_pubkey,
-										amount,
-										err
-									);
-									lightning::log_warn!(
-										&*probing_logger,
-										"probe_completed destination_node={} amount_msat={} state=SEND_FAILED error={:?}",
-										peer_pubkey,
-										amount,
-										err
-									);
-									tokio::time::sleep(probe_delay).await;
-									break 'amounts;
-								},
-								Err(ProbeError::InvalidInput(err)) => {
-									lightning::log_warn!(
-										&*probing_logger,
-										"Probe INVALID_INPUT to {} for {} msat (error: {}), skipping remaining amounts",
-										peer_pubkey,
-										amount,
-										err
-									);
-									lightning::log_warn!(
-										&*probing_logger,
-										"probe_completed destination_node={} amount_msat={} state=INVALID_INPUT error={}",
-										peer_pubkey,
-										amount,
-										err
-									);
-									tokio::time::sleep(probe_delay).await;
-									break 'amounts;
-								},
-							}
-						}
-
-						// Sleep between peers (except after the last peer)
-						if peer_idx < peer_count - 1 {
-							tokio::time::sleep(peer_delay).await;
-						}
-					}
-				}
-			});
-		}
+		probing::spawn_probing_loop(
+			probe_config,
+			probing::ProbingDeps {
+				channel_manager: Arc::clone(&channel_manager),
+				network_graph: Arc::clone(&network_graph),
+				logger: Arc::clone(&logger),
+				scorer: Arc::clone(&scorer),
+				scoring_fee_params,
+				tracker: Arc::clone(&probe_tracker),
+			},
+		);
 	}
 
 	// Start periodic rapid gossip sync updates
@@ -1729,17 +1029,19 @@ async fn start_ldk() {
 	let cli_fs_store = Arc::clone(&fs_store);
 	let cli_peer_manager = Arc::clone(&peer_manager);
 	let cli_output_sweeper = Arc::clone(&output_sweeper);
-	let cli_poll = tokio::task::spawn(cli::poll_for_user_input(
-		cli_peer_manager,
-		cli_channel_manager,
-		cli_chain_monitor,
+	let cli_logger = Arc::clone(&logger);
+	let cli_poll = tokio::task::spawn(cli::poll_for_user_input(cli::CliRuntime {
+		peer_manager: cli_peer_manager,
+		channel_manager: cli_channel_manager,
+		chain_monitor: cli_chain_monitor,
 		keys_manager,
 		network_graph,
 		inbound_payments,
 		outbound_payments,
-		cli_output_sweeper,
-		cli_fs_store,
-	));
+		output_sweeper: cli_output_sweeper,
+		fs_store: cli_fs_store,
+		logger: cli_logger,
+	}));
 
 	// Exit if either CLI polling exits or the background processor exits (which shouldn't happen
 	// unless we fail to write to the filesystem).
@@ -1757,28 +1059,41 @@ async fn start_ldk() {
 	peer_manager.disconnect_all_peers();
 
 	if let Err(e) = bg_res {
-		fs_store
+		if let Err(write_err) = fs_store
 			.write(
-				persist::CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-				persist::CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
-				persist::CHANNEL_MANAGER_PERSISTENCE_KEY,
+				ldk_persist::CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+				ldk_persist::CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+				ldk_persist::CHANNEL_MANAGER_PERSISTENCE_KEY,
 				channel_manager.encode(),
 			)
 			.await
-			.unwrap();
-		use lightning::util::logger::Logger;
-		lightning::log_error!(&*logger, "Last-ditch ChannelManager persistence completed");
-		panic!(
-			"ERR: background processing stopped with result {:?}, exiting.\n\
-			Last-ditch ChannelManager persistence completed",
-			e
-		);
+		{
+			lightning::log_error!(
+				&*logger,
+				"Last-ditch ChannelManager persistence failed: {}",
+				write_err
+			);
+		} else {
+			lightning::log_error!(&*logger, "Last-ditch ChannelManager persistence completed");
+		}
+		lightning::log_error!(&*logger, "ERR: background processing stopped: {:?}", e);
+		return;
 	}
 
 	// Stop the background processor.
 	if !bp_exit.is_closed() {
-		bp_exit.send(()).unwrap();
-		background_processor.await.unwrap().unwrap();
+		if let Err(e) = bp_exit.send(()) {
+			lightning::log_warn!(&*logger, "Failed to signal background processor shutdown: {}", e);
+		}
+		match background_processor.await {
+			Ok(Ok(())) => {},
+			Ok(Err(e)) => {
+				lightning::log_error!(&*logger, "Background processor shutdown failed: {:?}", e);
+			},
+			Err(e) => {
+				lightning::log_error!(&*logger, "Background processor task join failed: {}", e);
+			},
+		}
 	}
 }
 

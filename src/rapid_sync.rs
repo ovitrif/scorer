@@ -1,11 +1,11 @@
 use crate::{FilesystemLogger, NetworkGraph};
 use lightning::util::logger::Logger;
-use lightning_persister::fs_store::FilesystemStore;
 use lightning_rapid_gossip_sync::{GraphSyncError, RapidGossipSync};
 use reqwest::Client;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
+use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 
@@ -23,29 +23,19 @@ pub(crate) struct RapidGossipSyncManager {
 	ldk_data_dir: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub(crate) enum RapidSyncError {
+	#[error("download failed: {0}")]
 	DownloadFailed(String),
+	// GraphSyncError implements neither `Display` nor `std::error::Error`
+	// upstream, so we cannot use `#[from]` (which requires `Error`) and
+	// we render via Debug. Manual conversion via `From` below.
+	#[error("parse failed: {0:?}")]
 	ParseFailed(GraphSyncError),
-	IoError(io::Error),
+	#[error("I/O error: {0}")]
+	IoError(#[from] io::Error),
+	#[error("retry attempts exhausted")]
 	RetryExhausted,
-}
-
-impl std::fmt::Display for RapidSyncError {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			RapidSyncError::DownloadFailed(msg) => write!(f, "Download failed: {}", msg),
-			RapidSyncError::ParseFailed(e) => write!(f, "Parse failed: {:?}", e),
-			RapidSyncError::IoError(e) => write!(f, "IO error: {}", e),
-			RapidSyncError::RetryExhausted => write!(f, "Retry attempts exhausted"),
-		}
-	}
-}
-
-impl From<io::Error> for RapidSyncError {
-	fn from(e: io::Error) -> Self {
-		RapidSyncError::IoError(e)
-	}
 }
 
 impl From<GraphSyncError> for RapidSyncError {
@@ -55,9 +45,13 @@ impl From<GraphSyncError> for RapidSyncError {
 }
 
 impl RapidGossipSyncManager {
+	// The `fs_store` parameter is deliberately omitted: the rapid-sync
+	// state is persisted via a small flat file (`rapid_sync_state`) rather
+	// than the KVStore, so the `FilesystemStore` was never used. Dropping
+	// the dead parameter cleans up the call site in `main.rs`.
 	pub async fn new(
-		network_graph: Arc<NetworkGraph>, sync_url: Option<String>,
-		_fs_store: Arc<FilesystemStore>, logger: Arc<FilesystemLogger>, ldk_data_dir: String,
+		network_graph: Arc<NetworkGraph>, sync_url: Option<String>, logger: Arc<FilesystemLogger>,
+		ldk_data_dir: String,
 	) -> Result<Self, RapidSyncError> {
 		let rapid_sync = Arc::new(RapidGossipSync::new(network_graph, logger.clone()));
 
@@ -157,36 +151,45 @@ impl RapidGossipSyncManager {
 		}
 	}
 
-	async fn download_snapshot_attempt(&self, last_sync: u32) -> Result<Vec<u8>, String> {
+	async fn download_snapshot_attempt(&self, last_sync: u32) -> Result<Vec<u8>, RapidSyncError> {
 		let url = format!("{}{}", self.sync_url, last_sync);
 
 		lightning::log_info!(&*self.logger, "Downloading rapid gossip snapshot from: {}", url);
 
-		let response = self
-			.http_client
-			.get(&url)
-			.send()
-			.await
-			.map_err(|e| format!("HTTP request failed: {}", e))?;
+		let response = self.http_client.get(&url).send().await.map_err(|e| {
+			RapidSyncError::DownloadFailed(format!("HTTP request failed: {}", e))
+		})?;
 
 		if !response.status().is_success() {
-			return Err(format!("HTTP {} - {}", response.status(), response.status().as_str()));
+			return Err(RapidSyncError::DownloadFailed(format!(
+				"HTTP {} - {}",
+				response.status(),
+				response.status().as_str()
+			)));
 		}
 
 		let content_length = response.content_length().unwrap_or(0);
 		let mut downloaded = 0u64;
 		let mut data = Vec::new();
+		// Report progress at most a few times; the previous code logged
+		// on every chunk, which for a multi-MB snapshot produced hundreds
+		// of near-identical entries and hid more important log lines.
+		let progress_step_bytes: u64 =
+			if content_length > 0 { (content_length / 10).max(1) } else { u64::MAX };
+		let mut next_progress_threshold = progress_step_bytes;
 
 		// Use the response as a stream to show progress
 		use futures_util::StreamExt;
 		let mut stream = response.bytes_stream();
 
 		while let Some(chunk) = stream.next().await {
-			let chunk = chunk.map_err(|e| format!("Failed to read chunk: {}", e))?;
+			let chunk = chunk.map_err(|e| {
+				RapidSyncError::DownloadFailed(format!("Failed to read chunk: {}", e))
+			})?;
 			downloaded += chunk.len() as u64;
 			data.extend_from_slice(&chunk);
 
-			if content_length > 0 {
+			if content_length > 0 && downloaded >= next_progress_threshold {
 				let progress_pct = (downloaded as f64 / content_length as f64 * 100.0) as u32;
 				lightning::log_info!(
 					&*self.logger,
@@ -195,6 +198,8 @@ impl RapidGossipSyncManager {
 					content_length as f64 / 1_048_576.0,
 					progress_pct
 				);
+				next_progress_threshold =
+					next_progress_threshold.saturating_add(progress_step_bytes);
 			}
 		}
 
@@ -268,9 +273,9 @@ mod tests {
 	#[test]
 	fn test_rapid_sync_error_display() {
 		let download_error = RapidSyncError::DownloadFailed("Connection timeout".to_string());
-		assert_eq!(format!("{}", download_error), "Download failed: Connection timeout");
+		assert_eq!(format!("{}", download_error), "download failed: Connection timeout");
 
 		let retry_error = RapidSyncError::RetryExhausted;
-		assert_eq!(format!("{}", retry_error), "Retry attempts exhausted");
+		assert_eq!(format!("{}", retry_error), "retry attempts exhausted");
 	}
 }

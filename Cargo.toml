@@ -32,6 +32,7 @@ toml = { version = "0.8" }
 tokio = { version = "1", features = [ "io-util", "macros", "rt", "rt-multi-thread", "sync", "net", "time", "io-std" ] }
 reqwest = { version = "0.11", features = ["tokio-native-tls", "stream"] }
 futures-util = "0.3"
+thiserror = "1"
 
 # DNS bootstrap (BOLT-0010)
 hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }

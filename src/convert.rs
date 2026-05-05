@@ -1,7 +1,36 @@
 use bitcoin::{Address, BlockHash, Txid};
 use lightning_block_sync::http::JsonResponse;
+use serde_json::Value;
 use std::convert::TryInto;
+use std::io::{Error, ErrorKind};
 use std::str::FromStr;
+
+fn invalid_field(field: &str, message: &str) -> Error {
+	Error::new(
+		ErrorKind::InvalidData,
+		format!("invalid or missing field `{}` in bitcoind response: {}", field, message),
+	)
+}
+
+fn as_str_field<'a>(json: &'a Value, field: &str) -> Result<&'a str, Error> {
+	json[field].as_str().ok_or_else(|| invalid_field(field, "expected string"))
+}
+
+fn as_u64_field(json: &Value, field: &str) -> Result<u64, Error> {
+	json[field].as_u64().ok_or_else(|| invalid_field(field, "expected unsigned integer"))
+}
+
+fn as_i64_field(json: &Value, field: &str) -> Result<i64, Error> {
+	json[field].as_i64().ok_or_else(|| invalid_field(field, "expected signed integer"))
+}
+
+fn as_bool_field(json: &Value, field: &str) -> Result<bool, Error> {
+	json[field].as_bool().ok_or_else(|| invalid_field(field, "expected boolean"))
+}
+
+fn as_f64_field(json: &Value, field: &str) -> Result<f64, Error> {
+	json[field].as_f64().ok_or_else(|| invalid_field(field, "expected number"))
+}
 
 pub struct FundedTx {
 	pub changepos: i64,
@@ -12,8 +41,8 @@ impl TryInto<FundedTx> for JsonResponse {
 	type Error = std::io::Error;
 	fn try_into(self) -> std::io::Result<FundedTx> {
 		Ok(FundedTx {
-			changepos: self.0["changepos"].as_i64().unwrap(),
-			hex: self.0["hex"].as_str().unwrap().to_string(),
+			changepos: as_i64_field(&self.0, "changepos")?,
+			hex: as_str_field(&self.0, "hex")?.to_string(),
 		})
 	}
 }
@@ -23,7 +52,12 @@ pub struct RawTx(pub String);
 impl TryInto<RawTx> for JsonResponse {
 	type Error = std::io::Error;
 	fn try_into(self) -> std::io::Result<RawTx> {
-		Ok(RawTx(self.0.as_str().unwrap().to_string()))
+		Ok(RawTx(
+			self.0
+				.as_str()
+				.ok_or_else(|| invalid_field("<root>", "expected raw transaction hex string"))?
+				.to_string(),
+		))
 	}
 }
 
@@ -36,8 +70,8 @@ impl TryInto<SignedTx> for JsonResponse {
 	type Error = std::io::Error;
 	fn try_into(self) -> std::io::Result<SignedTx> {
 		Ok(SignedTx {
-			hex: self.0["hex"].as_str().unwrap().to_string(),
-			complete: self.0["complete"].as_bool().unwrap(),
+			hex: as_str_field(&self.0, "hex")?.to_string(),
+			complete: as_bool_field(&self.0, "complete")?,
 		})
 	}
 }
@@ -46,7 +80,12 @@ pub struct NewAddress(pub String);
 impl TryInto<NewAddress> for JsonResponse {
 	type Error = std::io::Error;
 	fn try_into(self) -> std::io::Result<NewAddress> {
-		Ok(NewAddress(self.0.as_str().unwrap().to_string()))
+		Ok(NewAddress(
+			self.0
+				.as_str()
+				.ok_or_else(|| invalid_field("<root>", "expected address string"))?
+				.to_string(),
+		))
 	}
 }
 
@@ -102,10 +141,15 @@ impl TryInto<BlockchainInfo> for JsonResponse {
 	type Error = std::io::Error;
 	fn try_into(self) -> std::io::Result<BlockchainInfo> {
 		Ok(BlockchainInfo {
-			latest_height: self.0["blocks"].as_u64().unwrap() as usize,
-			latest_blockhash: BlockHash::from_str(self.0["bestblockhash"].as_str().unwrap())
-				.unwrap(),
-			chain: self.0["chain"].as_str().unwrap().to_string(),
+			latest_height: as_u64_field(&self.0, "blocks")? as usize,
+			latest_blockhash: BlockHash::from_str(as_str_field(&self.0, "bestblockhash")?)
+				.map_err(|e| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("invalid field `bestblockhash` in bitcoind response: {}", e),
+					)
+				})?,
+			chain: as_str_field(&self.0, "chain")?.to_string(),
 		})
 	}
 }
@@ -122,22 +166,35 @@ pub struct ListUnspentResponse(pub Vec<ListUnspentUtxo>);
 impl TryInto<ListUnspentResponse> for JsonResponse {
 	type Error = std::io::Error;
 	fn try_into(self) -> Result<ListUnspentResponse, Self::Error> {
-		let utxos = self
-			.0
-			.as_array()
-			.unwrap()
-			.iter()
-			.map(|utxo| ListUnspentUtxo {
-				txid: Txid::from_str(utxo["txid"].as_str().unwrap()).unwrap(),
-				vout: utxo["vout"].as_u64().unwrap() as u32,
-				amount: bitcoin::Amount::from_btc(utxo["amount"].as_f64().unwrap())
-					.unwrap()
-					.to_sat(),
-				address: Address::from_str(utxo["address"].as_str().unwrap())
-					.unwrap()
-					.assume_checked(), // the expected network is not known at this point
-			})
-			.collect();
+		let utxo_entries =
+			self.0.as_array().ok_or_else(|| invalid_field("<root>", "expected array of UTXOs"))?;
+		let mut utxos = Vec::with_capacity(utxo_entries.len());
+		for utxo in utxo_entries {
+			let txid = Txid::from_str(as_str_field(utxo, "txid")?).map_err(|e| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!("invalid field `txid` in listunspent response: {}", e),
+				)
+			})?;
+			let vout = as_u64_field(utxo, "vout")? as u32;
+			let amount = bitcoin::Amount::from_btc(as_f64_field(utxo, "amount")?)
+				.map_err(|e| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("invalid field `amount` in listunspent response: {}", e),
+					)
+				})?
+				.to_sat();
+			let address = Address::from_str(as_str_field(utxo, "address")?)
+				.map_err(|e| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("invalid field `address` in listunspent response: {}", e),
+					)
+				})?
+				.assume_checked();
+			utxos.push(ListUnspentUtxo { txid, vout, amount, address });
+		}
 		Ok(ListUnspentResponse(utxos))
 	}
 }
