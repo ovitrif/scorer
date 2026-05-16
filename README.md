@@ -16,6 +16,49 @@ The only CLI argument is the storage directory path. All configuration is read f
 
 Use `config.example.toml` in the repo root as a template for your config file.
 
+## scorer-kit
+
+`scorer-kit` is an offline developer tool for LDK scorer files. It can inspect,
+decode, compare, validate, and merge serialized `ChannelLiquidities` binaries
+without starting a node.
+
+Build or run it with:
+
+```sh
+cargo run --bin scorer-kit -- --help
+```
+
+Common flows:
+
+```sh
+# Summarize a scorer binary.
+cargo run --bin scorer-kit -- inspect ./scores-a.bin --label source-a
+
+# Decode the full scorer binary to JSON, including historical buckets.
+cargo run --bin scorer-kit -- decode ./scores-a.bin \
+  --label source-a \
+  --save ./source-a.decoded.json
+
+# Compare two scorer binaries.
+cargo run --bin scorer-kit -- compare ./scores-a.bin ./scores-b.bin \
+  --left-label source-a \
+  --right-label source-b
+
+# Merge two scorer binaries using the default richer-history duplicate policy.
+cargo run --bin scorer-kit -- merge ./scores-b.bin ./scores-a.bin \
+  --label source-b \
+  --label source-a \
+  --output ./merged.bin \
+  --report ./merged.report.json
+```
+
+The default merge policy is `richer-history`: unique entries are preserved, and
+duplicate short-channel-id entries keep whichever side has stronger historical
+signal. Other policies are available via `--policy prefer-first`,
+`--policy prefer-last`, `--policy combine`, and `--policy newer`.
+
+Decoded JSON fixtures live in `test_data/scorer-kit/`.
+
 ## Configuration
 
 Config is loaded from `<storage_dir>/.ldk/config.toml` and strictly validated. Unknown
