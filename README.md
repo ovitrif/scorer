@@ -52,6 +52,11 @@ cargo run --bin scorer-kit -- merge ./scores-z.bin ./scores-b.bin \
   --report ./merged.report.json
 
 # Overlay only selected incoming channels onto a baseline scorer binary.
+cargo run --bin scorer-kit -- node-scids \
+  --graph ./network_graph_cache \
+  --node <node-pubkey> \
+  --scores ./scores-b.bin \
+  --save ./selected.scids
 cargo run --bin scorer-kit -- merge ./scores-z.bin ./scores-b.bin \
   --label source-z \
   --label source-b \
@@ -69,8 +74,14 @@ signal. Other policies are available via `--policy prefer-first`,
 Use `--overlay-scid` / `--overlay-scids-file` when only selected incoming
 channels should be merged. The first input is treated as the baseline and is not
 filtered; every later input is reduced to the listed short-channel-ids before
-merge policies are applied. Selecting by node requires an external graph or
-channel map because scorer binaries only contain short-channel-ids.
+merge policies are applied.
+
+Use `node-scids` to derive that allowlist from a serialized LDK `NetworkGraph`.
+Scorer binaries only contain short-channel-ids, so node-level selection needs the
+graph to map node pubkeys to channel IDs. Pass `--node` directly, or pass
+`--invoice` to recover the payee pubkey from a Bolt11 invoice. Passing `--scores`
+intersects the graph channels with a scorer file so the allowlist only includes
+channels that have incoming score entries.
 
 Decoded JSON scorer snapshots live in `data/scores/`.
 

@@ -13,9 +13,11 @@ embedding local paths, URLs, or source-specific names.
 
 For production-style review, prefer an explicit selected-channel overlay:
 source-z first as the baseline, source-b second as the incoming overlay,
-`--policy prefer-last`, and `--overlay-scids-file <selected.scids>`. Scorer
-binaries contain short-channel-ids, not node pubkeys, so node-level selection
-requires a graph or channel map to produce the SCID allowlist.
+`--policy prefer-last`, and `--overlay-scids-file <selected.scids>`.
+Use `scorer-kit node-scids --graph <network_graph_cache> --node <node-pubkey>
+--scores <source-b.bin> --save <selected.scids>` to derive that allowlist from a
+serialized LDK network graph. `--invoice <bolt11>` can be used instead of
+`--node` when the payee pubkey should be recovered from an invoice.
 
 Regenerate with:
 

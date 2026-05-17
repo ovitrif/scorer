@@ -6,18 +6,22 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use humansize::{format_size, BINARY};
+use lightning_invoice::Bolt11Invoice;
 use scorer_kit_lightning::io::Cursor;
+use scorer_kit_lightning::routing::gossip::{NetworkGraph, NodeId};
 use scorer_kit_lightning::routing::scoring::{
 	ChannelLiquidities, ChannelLiquidityDiagnostic, ChannelLiquidityMergeAction,
 	ProbabilisticScoringDecayParameters,
 };
-use scorer_kit_lightning::util::ser::{Readable, Writeable};
+use scorer_kit_lightning::util::logger::{Logger, Record};
+use scorer_kit_lightning::util::ser::{Readable, ReadableArgs, Writeable};
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -41,6 +45,8 @@ enum Command {
 	Compare(CompareArgs),
 	/// Merge two or more binary scorer files into a new scorer binary.
 	Merge(MergeArgs),
+	/// Extract short-channel-ids for selected node pubkeys from an LDK network graph.
+	NodeScids(NodeScidsArgs),
 	/// Validate that one or more files can be decoded as scorer files.
 	Validate(ValidateArgs),
 }
@@ -135,6 +141,28 @@ struct MergeArgs {
 struct ValidateArgs {
 	/// Binary scorer files to validate.
 	files: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Parser)]
+struct NodeScidsArgs {
+	/// Serialized LDK NetworkGraph file.
+	#[arg(long)]
+	graph: PathBuf,
+	/// Node pubkey to match. Repeat for multiple nodes.
+	#[arg(long = "node")]
+	nodes: Vec<String>,
+	/// Bolt11 invoice whose recovered payee pubkey should be matched. Repeatable.
+	#[arg(long = "invoice")]
+	invoices: Vec<String>,
+	/// Optional scorer file used to keep only SCIDs that have score entries.
+	#[arg(long)]
+	scores: Option<PathBuf>,
+	/// Output format. Text writes one SCID per line for direct use as an overlay allowlist.
+	#[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+	output: OutputFormat,
+	/// Write output to a file instead of stdout.
+	#[arg(long)]
+	save: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -341,6 +369,51 @@ struct MergeDecision {
 	incoming_last_datapoint_time_secs: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct NodeScidsReport {
+	graph: String,
+	graph_node_count: usize,
+	graph_channel_count: usize,
+	requested_node_count: usize,
+	matched_node_count: usize,
+	scid_count: usize,
+	score_filter: Option<NodeScidsScoreFilter>,
+	channels: Vec<NodeScidRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct NodeScidsScoreFilter {
+	file: String,
+	entry_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct NodeScidRow {
+	scid: u64,
+	node: String,
+	peer: String,
+	capacity_sats: Option<u64>,
+	has_one_to_two_update: bool,
+	has_two_to_one_update: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct NodeScidCsvRow {
+	scid: u64,
+	node: String,
+	peer: String,
+	capacity_sats: Option<u64>,
+	has_one_to_two_update: bool,
+	has_two_to_one_update: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NoopLogger;
+
+impl Logger for NoopLogger {
+	fn log(&self, _record: Record) {}
+}
+
 fn main() -> Result<()> {
 	let cli = Cli::parse();
 	match cli.command {
@@ -348,6 +421,7 @@ fn main() -> Result<()> {
 		Command::Decode(args) => decode(args),
 		Command::Compare(args) => compare(args),
 		Command::Merge(args) => merge(args),
+		Command::NodeScids(args) => node_scids(args),
 		Command::Validate(args) => validate(args),
 	}
 }
@@ -549,6 +623,109 @@ fn merge(args: MergeArgs) -> Result<()> {
 		output_diagnostics.len()
 	);
 	Ok(())
+}
+
+fn node_scids(args: NodeScidsArgs) -> Result<()> {
+	let mut requested_nodes = BTreeSet::new();
+	for node in &args.nodes {
+		let node =
+			NodeId::from_str(node).with_context(|| format!("parse node pubkey '{}'", node))?;
+		requested_nodes.insert(node);
+	}
+	for invoice in &args.invoices {
+		let invoice = parse_bolt11(invoice)?;
+		let payee = invoice.recover_payee_pub_key().to_string();
+		let node = NodeId::from_str(&payee)
+			.with_context(|| format!("parse recovered invoice payee pubkey '{}'", payee))?;
+		requested_nodes.insert(node);
+	}
+	if requested_nodes.is_empty() {
+		bail!("node-scids requires at least one --node or --invoice");
+	}
+
+	let score_filter = match &args.scores {
+		Some(path) => {
+			let score_file = read_score_file(path, default_label(path))?;
+			let scids: BTreeSet<u64> =
+				score_file.diagnostics.iter().map(|diag| diag.scid).collect();
+			Some((
+				NodeScidsScoreFilter {
+					file: path.display().to_string(),
+					entry_count: score_file.diagnostics.len(),
+				},
+				scids,
+			))
+		},
+		None => None,
+	};
+
+	let graph = read_network_graph(&args.graph)?;
+	let read_only_graph = graph.read_only();
+	let graph_node_count = read_only_graph.nodes().len();
+	let graph_channel_count = read_only_graph.channels().len();
+	let mut matched_nodes = BTreeSet::new();
+	let mut rows_by_scid = BTreeMap::new();
+
+	for (scid, channel) in read_only_graph.channels().unordered_iter() {
+		let matched = if requested_nodes.contains(&channel.node_one) {
+			Some((channel.node_one, channel.node_two))
+		} else if requested_nodes.contains(&channel.node_two) {
+			Some((channel.node_two, channel.node_one))
+		} else {
+			None
+		};
+
+		let Some((node, peer)) = matched else { continue };
+		if let Some((_, score_scids)) = &score_filter {
+			if !score_scids.contains(scid) {
+				continue;
+			}
+		}
+
+		matched_nodes.insert(node);
+		rows_by_scid.entry(*scid).or_insert_with(|| NodeScidRow {
+			scid: *scid,
+			node: node.to_string(),
+			peer: peer.to_string(),
+			capacity_sats: channel.capacity_sats,
+			has_one_to_two_update: channel.one_to_two.is_some(),
+			has_two_to_one_update: channel.two_to_one.is_some(),
+		});
+	}
+
+	let channels: Vec<NodeScidRow> = rows_by_scid.into_values().collect();
+	let report = NodeScidsReport {
+		graph: args.graph.display().to_string(),
+		graph_node_count,
+		graph_channel_count,
+		requested_node_count: requested_nodes.len(),
+		matched_node_count: matched_nodes.len(),
+		scid_count: channels.len(),
+		score_filter: score_filter.map(|(report, _)| report),
+		channels,
+	};
+
+	write_rendered(args.save, args.output, |writer, output| match output {
+		OutputFormat::Text => render_node_scids_text(writer, &report),
+		OutputFormat::Csv => render_node_scids_csv(writer, &report),
+		OutputFormat::Json => render_json(writer, &report),
+	})
+}
+
+fn read_network_graph(path: &Path) -> Result<NetworkGraph<NoopLogger>> {
+	let bytes = fs::read(path).with_context(|| format!("read network graph {}", path.display()))?;
+	let mut cursor = Cursor::new(&bytes);
+	ReadableArgs::read(&mut cursor, NoopLogger)
+		.map_err(|e| anyhow!("decode NetworkGraph from {}: {:?}", path.display(), e))
+}
+
+fn parse_bolt11(invoice: &str) -> Result<Bolt11Invoice> {
+	let invoice = invoice.trim();
+	let invoice = invoice
+		.strip_prefix("lightning:")
+		.or_else(|| invoice.strip_prefix("LIGHTNING:"))
+		.unwrap_or(invoice);
+	Bolt11Invoice::from_str(invoice).map_err(|e| anyhow!("parse bolt11 invoice: {:?}", e))
 }
 
 fn read_overlay_scids(args: &MergeArgs) -> Result<Option<BTreeSet<u64>>> {
@@ -919,6 +1096,26 @@ fn render_compare_csv<W: Write + ?Sized>(writer: &mut W, report: &CompareReport)
 	Ok(())
 }
 
+fn render_node_scids_text<W: Write + ?Sized>(
+	writer: &mut W, report: &NodeScidsReport,
+) -> Result<()> {
+	for row in &report.channels {
+		writeln!(writer, "{}", row.scid)?;
+	}
+	Ok(())
+}
+
+fn render_node_scids_csv<W: Write + ?Sized>(
+	writer: &mut W, report: &NodeScidsReport,
+) -> Result<()> {
+	let mut csv = csv::Writer::from_writer(writer);
+	for row in &report.channels {
+		csv.serialize(NodeScidCsvRow::from(row)).context("write node scid csv row")?;
+	}
+	csv.flush()?;
+	Ok(())
+}
+
 fn render_json<W: Write + ?Sized, T: Serialize>(writer: &mut W, value: &T) -> Result<()> {
 	serde_json::to_writer_pretty(writer, value).context("write json")?;
 	Ok(())
@@ -1042,6 +1239,19 @@ impl From<&CompareReport> for CompareCsvRow {
 			left_newer_overlap_count: report.left_newer_overlap_count,
 			right_newer_overlap_count: report.right_newer_overlap_count,
 			equal_datapoint_time_overlap_count: report.equal_datapoint_time_overlap_count,
+		}
+	}
+}
+
+impl From<&NodeScidRow> for NodeScidCsvRow {
+	fn from(row: &NodeScidRow) -> Self {
+		Self {
+			scid: row.scid,
+			node: row.node.clone(),
+			peer: row.peer.clone(),
+			capacity_sats: row.capacity_sats,
+			has_one_to_two_update: row.has_one_to_two_update,
+			has_two_to_one_update: row.has_two_to_one_update,
 		}
 	}
 }
