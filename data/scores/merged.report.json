@@ -1,6 +1,6 @@
 {
   "policy": "prefer-last",
-  "output": "data/scores/merged-selected-overlay.bin",
+  "output": "data/scores/merged.bin",
   "output_file_size_bytes": 1920514,
   "output_file_size_human": "1.83 MiB",
   "merge_timestamp_secs": 1778949824,
@@ -91,6 +91,19 @@
   },
   "duplicate_decisions": [
     {
+      "scid": 999345019285733377,
+      "existing_label": "source-z",
+      "incoming_label": "source-b",
+      "action": "replace-with-incoming",
+      "reason": "prefer-last policy",
+      "existing_total_valid_points_tracked": 50625.0,
+      "incoming_total_valid_points_tracked": 1048576.0,
+      "existing_history_bucket_sum": 30,
+      "incoming_history_bucket_sum": 64,
+      "existing_last_datapoint_time_secs": 1776633520,
+      "incoming_last_datapoint_time_secs": 1778774141
+    },
+    {
       "scid": 996743574623748097,
       "existing_label": "source-z",
       "incoming_label": "source-b",
@@ -115,19 +128,6 @@
       "incoming_history_bucket_sum": 1490,
       "existing_last_datapoint_time_secs": 1776580988,
       "incoming_last_datapoint_time_secs": 1778945864
-    },
-    {
-      "scid": 999345019285733377,
-      "existing_label": "source-z",
-      "incoming_label": "source-b",
-      "action": "replace-with-incoming",
-      "reason": "prefer-last policy",
-      "existing_total_valid_points_tracked": 50625.0,
-      "incoming_total_valid_points_tracked": 1048576.0,
-      "existing_history_bucket_sum": 30,
-      "incoming_history_bucket_sum": 64,
-      "existing_last_datapoint_time_secs": 1776633520,
-      "incoming_last_datapoint_time_secs": 1778774141
     }
   ]
 }

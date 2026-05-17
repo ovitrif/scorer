@@ -48,8 +48,8 @@ cargo run --bin scorer-kit -- compare ./scores-z.bin ./scores-b.bin \
 cargo run --bin scorer-kit -- merge ./scores-z.bin ./scores-b.bin \
   --label source-z \
   --label source-b \
-  --output ./merged.bin \
-  --report ./merged.report.json
+  --output ./merged-richer-history.bin \
+  --report ./merged-richer-history.report.json
 
 # Overlay only selected incoming channels onto a baseline scorer binary.
 cargo run --bin scorer-kit -- node-scids \
@@ -62,8 +62,8 @@ cargo run --bin scorer-kit -- merge ./scores-z.bin ./scores-b.bin \
   --label source-b \
   --policy prefer-last \
   --overlay-scids-file ./selected.scids \
-  --output ./merged-selected.bin \
-  --report ./merged-selected.report.json
+  --output ./merged.bin \
+  --report ./merged.report.json
 ```
 
 The default merge policy is `richer-history`: unique entries are preserved, and
@@ -84,7 +84,7 @@ intersects the graph channels with a scorer file so the allowlist only includes
 channels that have incoming score entries.
 
 Tracked scorer snapshots live in `data/scores/`, including decoded JSON reports
-and the selected-overlay binary candidate.
+and the selected overlay candidate at `data/scores/merged.bin`.
 
 ## Configuration
 
