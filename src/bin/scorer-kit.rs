@@ -381,7 +381,7 @@ struct NodeScidsReport {
 	channels: Vec<NodeScidRow>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct NodeScidsScoreFilter {
 	file: String,
 	entry_count: usize,
@@ -660,6 +660,19 @@ fn node_scids(args: NodeScidsArgs) -> Result<()> {
 	};
 
 	let graph = read_network_graph(&args.graph)?;
+	let report = build_node_scids_report(&args.graph, &graph, &requested_nodes, score_filter);
+
+	write_rendered(args.save, args.output, |writer, output| match output {
+		OutputFormat::Text => render_node_scids_text(writer, &report),
+		OutputFormat::Csv => render_node_scids_csv(writer, &report),
+		OutputFormat::Json => render_json(writer, &report),
+	})
+}
+
+fn build_node_scids_report(
+	graph_path: &Path, graph: &NetworkGraph<NoopLogger>, requested_nodes: &BTreeSet<NodeId>,
+	score_filter: Option<(NodeScidsScoreFilter, BTreeSet<u64>)>,
+) -> NodeScidsReport {
 	let read_only_graph = graph.read_only();
 	let graph_node_count = read_only_graph.nodes().len();
 	let graph_channel_count = read_only_graph.channels().len();
@@ -695,7 +708,7 @@ fn node_scids(args: NodeScidsArgs) -> Result<()> {
 
 	let channels: Vec<NodeScidRow> = rows_by_scid.into_values().collect();
 	let report = NodeScidsReport {
-		graph: args.graph.display().to_string(),
+		graph: graph_path.display().to_string(),
 		graph_node_count,
 		graph_channel_count,
 		requested_node_count: requested_nodes.len(),
@@ -705,11 +718,7 @@ fn node_scids(args: NodeScidsArgs) -> Result<()> {
 		channels,
 	};
 
-	write_rendered(args.save, args.output, |writer, output| match output {
-		OutputFormat::Text => render_node_scids_text(writer, &report),
-		OutputFormat::Csv => render_node_scids_csv(writer, &report),
-		OutputFormat::Json => render_json(writer, &report),
-	})
+	report
 }
 
 fn read_network_graph(path: &Path) -> Result<NetworkGraph<NoopLogger>> {
@@ -1259,6 +1268,23 @@ impl From<&NodeScidRow> for NodeScidCsvRow {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use bitcoin::network::Network;
+	use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+	use scorer_kit_lightning::types::features::ChannelFeatures;
+
+	const TEST_INVOICE: &str = concat!(
+		"lnbc100p1psj9jhxdqud3jxktt5w46x7unfv9kz6mn0v3jsnp4q0d3p2sfluzdx45tqcs",
+		"h2pu5qc7lgq0xs578ngs6s0s68ua4h7cvspp5q6rmq35js88zp5dvwrv9m459tnk2zunwj5jalqtyxqulh0l",
+		"5gflssp5nf55ny5gcrfl30xuhzj3nphgj27rstekmr9fw3ny5989s300gyus9qyysgqcqpcrzjqw2sxwe993",
+		"h5pcm4dxzpvttgza8zhkqxpgffcrf5v25nwpr3cmfg7z54kuqq8rgqqqqqqqq2qqqqq9qq9qrzjqd0ylaqcl",
+		"j9424x9m8h2vcukcgnm6s56xfgu3j78zyqzhgs4hlpzvznlugqq9vsqqqqqqqlgqqqqqeqq9qrzjqwldmj9d",
+		"ha74df76zhx6l9we0vjdquygcdt3kssupehe64g6yyp5yz5rhuqqwccqqyqqqqlgqqqqjcqq9qrzjqf9e58a",
+		"guqr0rcun0ajlvmzq3ek63cw2w282gv3z5uupmuwvgjtq2z55qsqqg6qqqyqqqrtnqqqzq3cqygrzjqvphms",
+		"ywntrrhqjcraumvc4y6r8v4z5v593trte429v4hredj7ms5z52usqq9ngqqqqqqqlgqqqqqqgq9qrzjq2v0v",
+		"p62g49p7569ev48cmulecsxe59lvaw3wlxm7r982zxa9zzj7z5l0cqqxusqqyqqqqlgqqqqqzsqygarl9fh3",
+		"8s0gyuxjjgux34w75dnc6xp2l35j7es3jd4ugt3lu0xzre26yg5m7ke54n2d5sym4xcmxtl8238xxvw5h5h5",
+		"j5r6drg6k6zcqj0fcwg"
+	);
 
 	#[test]
 	fn parse_scid_list_accepts_comments_commas_and_whitespace() {
@@ -1280,5 +1306,148 @@ mod tests {
 			.expect_err("invalid scid token should fail");
 
 		assert!(err.to_string().contains("not-a-scid"));
+	}
+
+	#[test]
+	fn parse_bolt11_accepts_lightning_uri_prefix() {
+		let invoice = parse_bolt11(&format!("lightning:{}", TEST_INVOICE)).expect("parse invoice");
+
+		assert_eq!(invoice.to_string(), TEST_INVOICE);
+	}
+
+	#[test]
+	fn node_scids_requires_node_or_invoice() {
+		let err = node_scids(NodeScidsArgs {
+			graph: PathBuf::from("unused-network-graph"),
+			nodes: vec![],
+			invoices: vec![],
+			scores: None,
+			output: OutputFormat::Text,
+			save: None,
+		})
+		.expect_err("empty node selection should fail before graph read");
+
+		assert!(err.to_string().contains("at least one --node or --invoice"));
+	}
+
+	#[test]
+	fn node_scids_report_filters_graph_channels_to_requested_nodes_and_score_scids() {
+		let target = test_node_id(2);
+		let peer_a = test_node_id(3);
+		let peer_b = test_node_id(4);
+		let graph = test_graph(&[
+			(10, target, peer_a, Some(1_000)),
+			(20, peer_b, target, Some(2_000)),
+			(30, peer_a, peer_b, Some(3_000)),
+		]);
+		let requested_nodes = BTreeSet::from([target]);
+		let score_scids = BTreeSet::from([20, 30]);
+
+		let report = build_node_scids_report(
+			Path::new("graph.bin"),
+			&graph,
+			&requested_nodes,
+			Some((
+				NodeScidsScoreFilter { file: "incoming.bin".to_string(), entry_count: 2 },
+				score_scids,
+			)),
+		);
+
+		assert_eq!(report.graph_node_count, 3);
+		assert_eq!(report.graph_channel_count, 3);
+		assert_eq!(report.requested_node_count, 1);
+		assert_eq!(report.matched_node_count, 1);
+		assert_eq!(report.scid_count, 1);
+		assert_eq!(report.score_filter.as_ref().unwrap().entry_count, 2);
+		assert_eq!(report.channels[0].scid, 20);
+		assert_eq!(report.channels[0].node, target.to_string());
+		assert_eq!(report.channels[0].peer, peer_b.to_string());
+		assert_eq!(report.channels[0].capacity_sats, Some(2_000));
+	}
+
+	#[test]
+	fn read_network_graph_decodes_serialized_ldk_graph() {
+		let target = test_node_id(2);
+		let peer = test_node_id(3);
+		let graph = test_graph(&[(42, target, peer, Some(50_000))]);
+		let mut graph_bytes = Vec::new();
+		graph.write(&mut graph_bytes).expect("serialize graph");
+		let dir = tempfile::tempdir().expect("tempdir");
+		let graph_path = dir.path().join("network_graph_cache");
+		fs::write(&graph_path, graph_bytes).expect("write graph");
+
+		let decoded = read_network_graph(&graph_path).expect("read graph");
+		let report =
+			build_node_scids_report(&graph_path, &decoded, &BTreeSet::from([target]), None);
+
+		assert_eq!(report.scid_count, 1);
+		assert_eq!(report.channels[0].scid, 42);
+		assert_eq!(report.channels[0].capacity_sats, Some(50_000));
+	}
+
+	#[test]
+	fn richer_history_policy_prefers_incoming_when_history_signal_is_stronger() {
+		let existing = diagnostic(7, true, 10.0, 1, 20);
+		let incoming = diagnostic(7, true, 20.0, 1, 10);
+
+		let (action, reason) =
+			choose_merge_action(MergePolicy::RicherHistory, &existing, &incoming);
+
+		assert_eq!(action, ChannelLiquidityMergeAction::ReplaceWithOther);
+		assert_eq!(reason, "incoming has richer historical signal");
+	}
+
+	#[test]
+	fn newer_policy_keeps_existing_on_equal_datapoint_time() {
+		let existing = diagnostic(7, true, 10.0, 1, 20);
+		let incoming = diagnostic(7, true, 20.0, 2, 20);
+
+		let (action, reason) = choose_merge_action(MergePolicy::Newer, &existing, &incoming);
+
+		assert_eq!(action, ChannelLiquidityMergeAction::KeepExisting);
+		assert_eq!(reason, "equal datapoint time; keeping existing");
+	}
+
+	fn test_graph(channels: &[(u64, NodeId, NodeId, Option<u64>)]) -> NetworkGraph<NoopLogger> {
+		let graph = NetworkGraph::new(Network::Bitcoin, NoopLogger);
+		for (scid, node_one, node_two, capacity_sats) in channels {
+			graph
+				.add_channel_from_partial_announcement(
+					*scid,
+					*capacity_sats,
+					0,
+					ChannelFeatures::empty(),
+					*node_one,
+					*node_two,
+				)
+				.expect("add test graph channel");
+		}
+		graph
+	}
+
+	fn test_node_id(secret_byte: u8) -> NodeId {
+		let secp_ctx = Secp256k1::new();
+		let secret = SecretKey::from_slice(&[secret_byte; 32]).expect("valid test secret key");
+		NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, &secret))
+	}
+
+	fn diagnostic(
+		scid: u64, has_history: bool, total_valid_points_tracked: f64, history_bucket_sum: u16,
+		last_datapoint_time_secs: u64,
+	) -> ChannelLiquidityDiagnostic {
+		let mut min_history_buckets = [0; 32];
+		min_history_buckets[0] = history_bucket_sum;
+		ChannelLiquidityDiagnostic {
+			scid,
+			min_liquidity_offset_msat: 0,
+			max_liquidity_offset_msat: 0,
+			last_updated_secs: last_datapoint_time_secs,
+			offset_history_last_updated_secs: last_datapoint_time_secs,
+			last_datapoint_time_secs,
+			has_history,
+			total_valid_points_tracked,
+			min_history_buckets,
+			max_history_buckets: [0; 32],
+		}
 	}
 }
