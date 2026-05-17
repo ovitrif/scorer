@@ -72,7 +72,7 @@ filtered; every later input is reduced to the listed short-channel-ids before
 merge policies are applied. Selecting by node requires an external graph or
 channel map because scorer binaries only contain short-channel-ids.
 
-Decoded JSON scorer snapshots live in `data/scorer-kit/`.
+Decoded JSON scorer snapshots live in `data/scores/`.
 
 ## Configuration
 
