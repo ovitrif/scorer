@@ -1,0 +1,133 @@
+{
+  "policy": "prefer-last",
+  "output": "data/scores/merged-selected-overlay.bin",
+  "output_file_size_bytes": 1920514,
+  "output_file_size_human": "1.83 MiB",
+  "merge_timestamp_secs": 1778949824,
+  "overlay_filter": {
+    "mode": "incoming-scid-allowlist",
+    "allowed_scid_count": 20,
+    "incoming_files": [
+      {
+        "label": "source-b",
+        "original_entry_count": 8606,
+        "included_entry_count": 5,
+        "removed_entry_count": 8601,
+        "missing_allowed_scid_count": 15
+      }
+    ]
+  },
+  "inputs": [
+    {
+      "label": "source-z",
+      "file_size_bytes": 1920096,
+      "file_size_human": "1.83 MiB",
+      "entry_count": 9187,
+      "history_populated_count": 9187,
+      "history_empty_count": 0,
+      "history_populated_pct": 100.0,
+      "min_offset_msat_p50": 0,
+      "min_offset_msat_p95": 181138,
+      "min_offset_msat_max": 42362471700,
+      "max_offset_msat_p50": 0,
+      "max_offset_msat_p95": 968633,
+      "max_offset_msat_max": 153597649374,
+      "offset_window_msat_p50": 0,
+      "offset_window_msat_p95": 283366,
+      "offset_window_msat_max": 153597649374,
+      "total_valid_points_tracked_p50": 34657974.0,
+      "total_valid_points_tracked_p95": 5.580585356479282e16,
+      "total_valid_points_tracked_max": 1.624777688307544e19
+    },
+    {
+      "label": "source-b",
+      "file_size_bytes": 1798667,
+      "file_size_human": "1.72 MiB",
+      "entry_count": 5,
+      "history_populated_count": 5,
+      "history_empty_count": 0,
+      "history_populated_pct": 100.0,
+      "min_offset_msat_p50": 0,
+      "min_offset_msat_p95": 552533,
+      "min_offset_msat_max": 552533,
+      "max_offset_msat_p50": 0,
+      "max_offset_msat_p95": 48685369,
+      "max_offset_msat_max": 48685369,
+      "offset_window_msat_p50": 0,
+      "offset_window_msat_p95": 48132836,
+      "offset_window_msat_max": 48132836,
+      "total_valid_points_tracked_p50": 61013446081.0,
+      "total_valid_points_tracked_p95": 6.711237582995614e18,
+      "total_valid_points_tracked_max": 6.711237582995614e18
+    }
+  ],
+  "output_summary": {
+    "label": "merged",
+    "file_size_bytes": 1920514,
+    "file_size_human": "1.83 MiB",
+    "entry_count": 9189,
+    "history_populated_count": 9189,
+    "history_empty_count": 0,
+    "history_populated_pct": 100.0,
+    "min_offset_msat_p50": 0,
+    "min_offset_msat_p95": 0,
+    "min_offset_msat_max": 552533,
+    "max_offset_msat_p50": 0,
+    "max_offset_msat_p95": 0,
+    "max_offset_msat_max": 48685369,
+    "offset_window_msat_p50": 0,
+    "offset_window_msat_p95": 0,
+    "offset_window_msat_max": 48132836,
+    "total_valid_points_tracked_p50": 17703994.0,
+    "total_valid_points_tracked_p95": 2.7050894481444176e16,
+    "total_valid_points_tracked_max": 1.624777688307544e19
+  },
+  "stats": {
+    "input_count": 2,
+    "duplicate_count": 3,
+    "kept_existing_count": 0,
+    "replaced_with_incoming_count": 3,
+    "combined_count": 0
+  },
+  "duplicate_decisions": [
+    {
+      "scid": 996743574623748097,
+      "existing_label": "source-z",
+      "incoming_label": "source-b",
+      "action": "replace-with-incoming",
+      "reason": "prefer-last policy",
+      "existing_total_valid_points_tracked": 2581520.0,
+      "incoming_total_valid_points_tracked": 6.711237582995614e18,
+      "existing_history_bucket_sum": 92,
+      "incoming_history_bucket_sum": 116772,
+      "existing_last_datapoint_time_secs": 1778080305,
+      "incoming_last_datapoint_time_secs": 1778949755
+    },
+    {
+      "scid": 999948650899111936,
+      "existing_label": "source-z",
+      "incoming_label": "source-b",
+      "action": "replace-with-incoming",
+      "reason": "prefer-last policy",
+      "existing_total_valid_points_tracked": 50625.0,
+      "incoming_total_valid_points_tracked": 308052750625.0,
+      "existing_history_bucket_sum": 30,
+      "incoming_history_bucket_sum": 1490,
+      "existing_last_datapoint_time_secs": 1776580988,
+      "incoming_last_datapoint_time_secs": 1778945864
+    },
+    {
+      "scid": 999345019285733377,
+      "existing_label": "source-z",
+      "incoming_label": "source-b",
+      "action": "replace-with-incoming",
+      "reason": "prefer-last policy",
+      "existing_total_valid_points_tracked": 50625.0,
+      "incoming_total_valid_points_tracked": 1048576.0,
+      "existing_history_bucket_sum": 30,
+      "incoming_history_bucket_sum": 64,
+      "existing_last_datapoint_time_secs": 1776633520,
+      "incoming_last_datapoint_time_secs": 1778774141
+    }
+  ]
+}
