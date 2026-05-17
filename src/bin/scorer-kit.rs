@@ -123,6 +123,12 @@ struct MergeArgs {
 	/// Unix timestamp to normalize scores to before merging. Defaults to the newest timestamp found.
 	#[arg(long)]
 	decay_to_secs: Option<u64>,
+	/// Restrict incoming files to this short-channel-id. Repeatable. The first input is not filtered.
+	#[arg(long = "overlay-scid")]
+	overlay_scids: Vec<u64>,
+	/// Restrict incoming files to short-channel-ids listed in a text file. Accepts whitespace or commas.
+	#[arg(long = "overlay-scids-file")]
+	overlay_scids_files: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -288,10 +294,27 @@ struct MergeReport {
 	output_file_size_bytes: u64,
 	output_file_size_human: String,
 	merge_timestamp_secs: u64,
+	overlay_filter: Option<OverlayFilterReport>,
 	inputs: Vec<Summary>,
 	output_summary: Summary,
 	stats: MergeStats,
 	duplicate_decisions: Vec<MergeDecision>,
+}
+
+#[derive(Debug, Serialize)]
+struct OverlayFilterReport {
+	mode: &'static str,
+	allowed_scid_count: usize,
+	incoming_files: Vec<OverlayFilteredInput>,
+}
+
+#[derive(Debug, Serialize)]
+struct OverlayFilteredInput {
+	label: String,
+	original_entry_count: usize,
+	included_entry_count: usize,
+	removed_entry_count: usize,
+	missing_allowed_scid_count: usize,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -432,6 +455,11 @@ fn merge(args: MergeArgs) -> Result<()> {
 		input_files.push(read_score_file(path, label)?);
 	}
 
+	let overlay_scids = read_overlay_scids(&args)?;
+	let overlay_filter = overlay_scids
+		.as_ref()
+		.map(|allowed_scids| apply_overlay_filter(&mut input_files, allowed_scids));
+
 	let merge_timestamp_secs = args.decay_to_secs.unwrap_or_else(|| {
 		input_files
 			.iter()
@@ -503,6 +531,7 @@ fn merge(args: MergeArgs) -> Result<()> {
 		output_file_size_bytes: serialized.len() as u64,
 		output_file_size_human: format_size(serialized.len(), BINARY),
 		merge_timestamp_secs,
+		overlay_filter,
 		inputs: input_summaries,
 		output_summary,
 		stats,
@@ -520,6 +549,72 @@ fn merge(args: MergeArgs) -> Result<()> {
 		output_diagnostics.len()
 	);
 	Ok(())
+}
+
+fn read_overlay_scids(args: &MergeArgs) -> Result<Option<BTreeSet<u64>>> {
+	let mut scids: BTreeSet<u64> = args.overlay_scids.iter().copied().collect();
+	for path in &args.overlay_scids_files {
+		let contents = fs::read_to_string(path)
+			.with_context(|| format!("read overlay scids file {}", path.display()))?;
+		parse_scid_list(&contents, path, &mut scids)?;
+	}
+
+	if scids.is_empty() {
+		Ok(None)
+	} else {
+		Ok(Some(scids))
+	}
+}
+
+fn parse_scid_list(contents: &str, path: &Path, scids: &mut BTreeSet<u64>) -> Result<()> {
+	for (line_idx, line) in contents.lines().enumerate() {
+		let line_without_comment = line.split('#').next().unwrap_or("").trim();
+		for token in line_without_comment
+			.split(|c: char| c == ',' || c.is_ascii_whitespace())
+			.filter(|token| !token.is_empty())
+		{
+			let scid = token.parse::<u64>().with_context(|| {
+				format!("parse scid '{}' in {}:{}", token, path.display(), line_idx + 1)
+			})?;
+			scids.insert(scid);
+		}
+	}
+	Ok(())
+}
+
+fn apply_overlay_filter(
+	input_files: &mut [ScoreFile], allowed_scids: &BTreeSet<u64>,
+) -> OverlayFilterReport {
+	let mut incoming_files = Vec::new();
+	for file in input_files.iter_mut().skip(1) {
+		let original_entry_count = file.diagnostics.len();
+		let scids_to_remove: Vec<u64> = file
+			.diagnostics
+			.iter()
+			.filter(|diag| !allowed_scids.contains(&diag.scid))
+			.map(|diag| diag.scid)
+			.collect();
+
+		for scid in scids_to_remove {
+			file.liquidities.remove(scid);
+		}
+		file.diagnostics = file.liquidities.diagnostics();
+
+		let included_entry_count = file.diagnostics.len();
+		incoming_files.push(OverlayFilteredInput {
+			label: file.label.clone(),
+			original_entry_count,
+			included_entry_count,
+			removed_entry_count: original_entry_count.saturating_sub(included_entry_count),
+			missing_allowed_scid_count: allowed_scids.len().saturating_sub(included_entry_count),
+		});
+	}
+
+	OverlayFilterReport {
+		mode: "incoming-scid-allowlist",
+		allowed_scid_count: allowed_scids.len(),
+		incoming_files,
+	}
 }
 
 fn validate(args: ValidateArgs) -> Result<()> {
@@ -948,5 +1043,32 @@ impl From<&CompareReport> for CompareCsvRow {
 			right_newer_overlap_count: report.right_newer_overlap_count,
 			equal_datapoint_time_overlap_count: report.equal_datapoint_time_overlap_count,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn parse_scid_list_accepts_comments_commas_and_whitespace() {
+		let mut scids = BTreeSet::new();
+		parse_scid_list(
+			"42, 43\n# ignored\n44 45 # trailing\n",
+			Path::new("scids.txt"),
+			&mut scids,
+		)
+		.expect("parse scids");
+
+		assert_eq!(scids.into_iter().collect::<Vec<_>>(), vec![42, 43, 44, 45]);
+	}
+
+	#[test]
+	fn parse_scid_list_rejects_non_decimal_tokens() {
+		let mut scids = BTreeSet::new();
+		let err = parse_scid_list("42\nnot-a-scid\n", Path::new("scids.txt"), &mut scids)
+			.expect_err("invalid scid token should fail");
+
+		assert!(err.to_string().contains("not-a-scid"));
 	}
 }

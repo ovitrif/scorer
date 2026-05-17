@@ -32,24 +32,33 @@ Common flows:
 
 ```sh
 # Summarize a scorer binary.
-cargo run --bin scorer-kit -- inspect ./scores-a.bin --label source-a
+cargo run --bin scorer-kit -- inspect ./scores-z.bin --label source-z
 
 # Decode the full scorer binary to JSON, including historical buckets.
-cargo run --bin scorer-kit -- decode ./scores-a.bin \
-  --label source-a \
-  --save ./source-a.decoded.json
+cargo run --bin scorer-kit -- decode ./scores-z.bin \
+  --label source-z \
+  --save ./source-z.decoded.json
 
 # Compare two scorer binaries.
-cargo run --bin scorer-kit -- compare ./scores-a.bin ./scores-b.bin \
-  --left-label source-a \
+cargo run --bin scorer-kit -- compare ./scores-z.bin ./scores-b.bin \
+  --left-label source-z \
   --right-label source-b
 
 # Merge two scorer binaries using the default richer-history duplicate policy.
-cargo run --bin scorer-kit -- merge ./scores-b.bin ./scores-a.bin \
+cargo run --bin scorer-kit -- merge ./scores-z.bin ./scores-b.bin \
+  --label source-z \
   --label source-b \
-  --label source-a \
   --output ./merged.bin \
   --report ./merged.report.json
+
+# Overlay only selected incoming channels onto a baseline scorer binary.
+cargo run --bin scorer-kit -- merge ./scores-z.bin ./scores-b.bin \
+  --label source-z \
+  --label source-b \
+  --policy prefer-last \
+  --overlay-scids-file ./selected.scids \
+  --output ./merged-selected.bin \
+  --report ./merged-selected.report.json
 ```
 
 The default merge policy is `richer-history`: unique entries are preserved, and
@@ -57,7 +66,13 @@ duplicate short-channel-id entries keep whichever side has stronger historical
 signal. Other policies are available via `--policy prefer-first`,
 `--policy prefer-last`, `--policy combine`, and `--policy newer`.
 
-Decoded JSON fixtures live in `test_data/scorer-kit/`.
+Use `--overlay-scid` / `--overlay-scids-file` when only selected incoming
+channels should be merged. The first input is treated as the baseline and is not
+filtered; every later input is reduced to the listed short-channel-ids before
+merge policies are applied. Selecting by node requires an external graph or
+channel map because scorer binaries only contain short-channel-ids.
+
+Decoded JSON scorer snapshots live in `data/scorer-kit/`.
 
 ## Configuration
 
