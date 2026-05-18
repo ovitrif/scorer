@@ -13,5 +13,8 @@ Cargo.lock
 # RPC auth
 .env
 
+# Local scorer-kit outputs and score snapshots
+/data/
+
 # IDEs
 .idea/

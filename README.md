@@ -83,8 +83,9 @@ graph to map node pubkeys to channel IDs. Pass `--node` directly, or pass
 intersects the graph channels with a scorer file so the allowlist only includes
 channels that have incoming score entries.
 
-Tracked scorer snapshots live in `data/scores/`, including decoded JSON reports
-and the selected overlay candidate at `data/scores/merged.bin`.
+Scorer snapshots, decoded JSON reports, and merged binaries are generated
+artifacts. Keep them outside version control, for example under
+`target/scorer-kit/`.
 
 ## Configuration
 
