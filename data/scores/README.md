@@ -18,6 +18,8 @@ source-specific names.
 For production-style review, prefer an explicit selected-channel overlay:
 source-z first as the baseline, source-b second as the incoming overlay,
 `--policy prefer-last`, and `--overlay-scids-file <selected.scids>`.
+This overlay path preserves source-z without decay and only replaces or inserts
+allowlisted source-b entries.
 Use `scorer-kit node-scids --graph <network_graph_cache> --node <node-pubkey>
 --scores <source-b.bin> --save <selected.scids>` to derive that allowlist from a
 serialized LDK network graph. `--invoice <bolt11>` can be used instead of

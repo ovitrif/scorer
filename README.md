@@ -72,9 +72,9 @@ signal. Other policies are available via `--policy prefer-first`,
 `--policy prefer-last`, `--policy combine`, and `--policy newer`.
 
 Use `--overlay-scid` / `--overlay-scids-file` when only selected incoming
-channels should be merged. The first input is treated as the baseline and is not
-filtered; every later input is reduced to the listed short-channel-ids before
-merge policies are applied.
+channels should be merged. Overlay merges preserve the first input as the
+baseline without decaying or normalizing it; every later input is reduced to the
+listed short-channel-ids before merge policies are applied.
 
 Use `node-scids` to derive that allowlist from a serialized LDK `NetworkGraph`.
 Scorer binaries only contain short-channel-ids, so node-level selection needs the

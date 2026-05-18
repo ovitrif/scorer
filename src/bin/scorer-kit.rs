@@ -126,7 +126,7 @@ struct MergeArgs {
 	/// Write a JSON report describing the merge.
 	#[arg(long)]
 	report: Option<PathBuf>,
-	/// Unix timestamp to normalize scores to before merging. Defaults to the newest timestamp found.
+	/// Unix timestamp to normalize scores to before merging. Ignored for overlay merges.
 	#[arg(long)]
 	decay_to_secs: Option<u64>,
 	/// Restrict incoming files to this short-channel-id. Repeatable. The first input is not filtered.
@@ -322,6 +322,7 @@ struct MergeReport {
 	output_file_size_bytes: u64,
 	output_file_size_human: String,
 	merge_timestamp_secs: u64,
+	preserve_baseline_without_decay: bool,
 	overlay_filter: Option<OverlayFilterReport>,
 	inputs: Vec<Summary>,
 	output_summary: Summary,
@@ -530,6 +531,7 @@ fn merge(args: MergeArgs) -> Result<()> {
 	}
 
 	let overlay_scids = read_overlay_scids(&args)?;
+	let preserve_baseline_without_decay = overlay_scids.is_some();
 	let overlay_filter = overlay_scids
 		.as_ref()
 		.map(|allowed_scids| apply_overlay_filter(&mut input_files, allowed_scids));
@@ -558,36 +560,42 @@ fn merge(args: MergeArgs) -> Result<()> {
 		let incoming_label = incoming.label.clone();
 		let policy = args.policy;
 		let current_existing_label = existing_label.clone();
-		merged.merge_with(
-			incoming.liquidities,
-			merge_timestamp,
-			ProbabilisticScoringDecayParameters::default(),
-			|existing, other| {
-				let (action, reason) = choose_merge_action(policy, existing, other);
-				stats.duplicate_count += 1;
-				match action {
-					ChannelLiquidityMergeAction::KeepExisting => stats.kept_existing_count += 1,
-					ChannelLiquidityMergeAction::ReplaceWithOther => {
-						stats.replaced_with_incoming_count += 1
-					},
-					ChannelLiquidityMergeAction::Combine => stats.combined_count += 1,
-				}
-				decisions.push(MergeDecision {
-					scid: existing.scid,
-					existing_label: current_existing_label.clone(),
-					incoming_label: incoming_label.clone(),
-					action: merge_action_name(action).to_string(),
-					reason,
-					existing_total_valid_points_tracked: existing.total_valid_points_tracked,
-					incoming_total_valid_points_tracked: other.total_valid_points_tracked,
-					existing_history_bucket_sum: history_bucket_sum(existing),
-					incoming_history_bucket_sum: history_bucket_sum(other),
-					existing_last_datapoint_time_secs: existing.last_datapoint_time_secs,
-					incoming_last_datapoint_time_secs: other.last_datapoint_time_secs,
-				});
-				action
-			},
-		);
+		let mut record_decision = |existing: &ChannelLiquidityDiagnostic,
+		                           other: &ChannelLiquidityDiagnostic| {
+			let (action, reason) = choose_merge_action(policy, existing, other);
+			stats.duplicate_count += 1;
+			match action {
+				ChannelLiquidityMergeAction::KeepExisting => stats.kept_existing_count += 1,
+				ChannelLiquidityMergeAction::ReplaceWithOther => {
+					stats.replaced_with_incoming_count += 1
+				},
+				ChannelLiquidityMergeAction::Combine => stats.combined_count += 1,
+			}
+			decisions.push(MergeDecision {
+				scid: existing.scid,
+				existing_label: current_existing_label.clone(),
+				incoming_label: incoming_label.clone(),
+				action: merge_action_name(action).to_string(),
+				reason,
+				existing_total_valid_points_tracked: existing.total_valid_points_tracked,
+				incoming_total_valid_points_tracked: other.total_valid_points_tracked,
+				existing_history_bucket_sum: history_bucket_sum(existing),
+				incoming_history_bucket_sum: history_bucket_sum(other),
+				existing_last_datapoint_time_secs: existing.last_datapoint_time_secs,
+				incoming_last_datapoint_time_secs: other.last_datapoint_time_secs,
+			});
+			action
+		};
+		if preserve_baseline_without_decay {
+			merged.merge_without_decay(incoming.liquidities, &mut record_decision);
+		} else {
+			merged.merge_with(
+				incoming.liquidities,
+				merge_timestamp,
+				ProbabilisticScoringDecayParameters::default(),
+				&mut record_decision,
+			);
+		}
 		existing_label = format!("merged-through-{}", incoming_label);
 	}
 
@@ -605,6 +613,7 @@ fn merge(args: MergeArgs) -> Result<()> {
 		output_file_size_bytes: serialized.len() as u64,
 		output_file_size_human: format_size(serialized.len(), BINARY),
 		merge_timestamp_secs,
+		preserve_baseline_without_decay,
 		overlay_filter,
 		inputs: input_summaries,
 		output_summary,
