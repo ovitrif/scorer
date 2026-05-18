@@ -9,7 +9,7 @@ edition = "2018"
 
 [dependencies]
 lightning = { version = "0.2.0", features = ["dnssec"] }
-scorer_kit_lightning = { package = "lightning", git = "https://github.com/synonymdev/rust-lightning", rev = "54698b1863b351fd79c7e3866bf598a184c8a5b5", features = ["std"] }
+scorer_kit_lightning = { package = "lightning", git = "https://github.com/synonymdev/rust-lightning", branch = "main", features = ["std"] }
 lightning-block-sync = { version = "0.2.0", features = [ "rpc-client", "tokio" ] }
 lightning-dns-resolver = { version = "0.3.0" }
 lightning-invoice = { version = "0.34.0" }
