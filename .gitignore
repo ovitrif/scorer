@@ -12,3 +12,6 @@ Cargo.lock
 
 # RPC auth
 .env
+
+# IDEs
+.idea/
